@@ -36,67 +36,93 @@ def _parse_price_from_obs(obs: str) -> Optional[float]:
         return float(m.group(1).replace(",", ""))
     except Exception:
         return None
+
 def run_item_micro_agent(state: LaserState, llm: BaseLanguageModel, enable_feedback: bool = False, max_inner_steps: int = 3) -> Dict[str, Any]:
-    """A small internal loop for the Item page to mimic original item_page_agent behavior.
-    Strategy:
-      1) If item appears to satisfy instruction (price within budget, or unknown), bias to Buy Now.
-      2) Otherwise, open missing details (Description/Features/Reviews) at most once each to gather info.
-      3) If still not a match, go Previous.
-    """
-    logging.info("[아이템 마이크로 에이전트] 시작")
-    toolkit = ToolKit(state["_env"])  # reuse the same env
-    visited = {"description": False, "features": False, "reviews": False}
-
-    user_instruction = state.get("user_instruction", "")
-    budget = _extract_max_price_from_instruction(user_instruction)
-
+    logging.info("[아이템 마이크로 에이전트] 시작 (원본 LASER 스타일)")
+    toolkit = ToolKit(state["_env"])
     obs = state.get("obs", "") or ""
+    user_instruction = state.get("user_instruction", "")
+    step_count = state.get("step_count", 0)
     raw_action_history = state.get("action_history") or []
     thought_history = state.get("thought_history") or []
-    step_count = state.get("step_count", 0)
+    visited = {"description": False, "features": False, "reviews": False}
+    additional_info = []
+    available_specs = [description, reviews, features, buy_now, previous_page]
 
-    for inner in range(max_inner_steps):
-        # quick price check
-        price = _parse_price_from_obs(obs)
-        if budget is not None and price is not None and price <= budget:
-            # Bias to buy if within budget
-            llm_action = {"name": "buy_now", "arguments": {}}
-            logging.info("[아이템 마이크로 에이전트] 예산 내 가격 확인 → Buy Now로 편향")
-        else:
-            # ask LLM once per inner loop using the usual choose_next_action
-            allowed_specs = [description, features, reviews, buy_now, previous_page]
-            decision = choose_next_action({**state, "obs": obs}, allowed_specs, llm, enable_feedback)
-            llm_action = decision["action"] or {"name": "previous_page", "arguments": {}}
-            llm_thought = decision.get("thought", "")
-            thought_history += [llm_thought]
+    for _ in range(max_inner_steps):
+        # 누적 observation 구성
+        full_obs = obs + ("\n" + "\n".join(additional_info) if additional_info else "")
+        decision = choose_next_action({**state, "obs": full_obs}, available_specs, llm, enable_feedback)
+        llm_action = decision.get("action") or {"name": "previous_page", "arguments": {}}
+        llm_action["name"] = (llm_action.get("name") or "").lower()
+        action_name = llm_action["name"]
+        llm_thought = decision.get("thought", "")
+        thought_history.append(llm_thought)
 
-            # if LLM didn't call any info-gathering tools and didn't buy, prefer one missing detail once
-            name_lower = (llm_action.get("name") or "").lower()
-            if name_lower not in ("buy_now", "previous_page", "description", "features", "reviews"):
-                # guard
-                name_lower = "previous_page"
-            if name_lower not in ("buy_now", "previous_page"):
-                if not visited.get(name_lower, False):
-                    visited[name_lower] = True
-                else:
-                    # already visited → gently bias to buy if price unknown or within budget
-                    if price is None or (budget is not None and price <= budget):
-                        name_lower = "buy_now"
-                    else:
-                        name_lower = "previous_page"
-                llm_action = {"name": name_lower, "arguments": llm_action.get("arguments", {})}
+        # Logging: LLM이 선택한 도구와 visited 상태 출력
+        logging.info(f"[Item Loop] LLM 선택 도구: {action_name}")
+        logging.info(f"[Item Loop] visited 상태: {visited}")
 
-        # Execute
+        # Prev는 명시적으로 처리
+        if action_name == "previous_page":
+            if not all(visited.values()):
+                # 탐색 도구 남아있으면 Prev 차단
+                fallback = next((k for k, v in visited.items() if not v), "description")
+                action_name = fallback
+                llm_action = {"name": action_name, "arguments": {}}
+                logging.info(f"[Item Loop] Prev 차단 → 대체 도구: {action_name}")
+        elif action_name in visited:
+            if not visited[action_name]:
+                visited[action_name] = True
+                logging.info(f"[Item Loop] 처음 열람한 도구: {action_name}")
+            elif not all(visited.values()):
+                fallback = next((k for k, v in visited.items() if not v), "description")
+                action_name = fallback
+                llm_action = {"name": action_name, "arguments": {}}
+                logging.info(f"[Item Loop] 중복 도구 선택 → 대체 도구: {action_name}")
+
+        # 툴 실행
         obs_next, reward, done, info = toolkit.execute(llm_action)
         obs_next = obs_next or ""
-        raw_action = info.get("predicted_action", "") if "predicted_action" in info else f"{llm_action.get('name')}({llm_action.get('arguments', {})})"
-        raw_action_history += [raw_action]
+        raw_action = info.get("predicted_action", f"{action_name}()")
+        raw_action_history.append(raw_action)
         step_count += 1
 
-        # stop conditions
+        # Buy Now일 경우 즉시 종료
+        if action_name == "buy_now":
+            logging.info("[아이템 마이크로 에이전트] Buy Now 선택됨 → 종료")
+            selected_item_id = (
+                info.get("selected_item_id")
+                or next((a for a in raw_action_history[::-1] if a.startswith("click[") and len(a) > 6), "")
+                .split("[")[-1].split("]")[0]
+            )
+            item_name_match = re.search(r"\n([\w\s\.,\(\)-]+)\nPrice: \$([\d\.,]+(?: to \$[\d\.,]+)?)", obs, re.DOTALL)
+            item_name = item_name_match.group(1).strip() if item_name_match else "Unknown Item"
+            item_price = item_name_match.group(2).strip() if item_name_match else "N/A"
+            selected_item = {
+                "item_id": selected_item_id,
+                "title": item_name,
+                "price": item_price,
+                "url": None,
+                "source_state": "Item",
+            }
+            return {
+                "obs": obs_next,
+                "url": None,
+                "last_action": raw_action,
+                "step_count": step_count,
+                "action_history": raw_action_history,
+                "thought_history": thought_history,
+                "current_laser_state": "Stopping",
+                "route": "to_stop",
+                "info": info,
+                "selected_item_id": selected_item_id,
+                "selected_item": selected_item,
+            }
+
+        # 종료 조건: 에러 or done
         if done or info.get("error"):
-            # finalize state to Stopping
-            logging.info("[아이템 마이크로 에이전트] 종료 조건 충족")
+            logging.info("[아이템 마이크로 에이전트] done=True or 에러 발생 → 종료")
             return {
                 "obs": obs_next,
                 "url": None,
@@ -109,30 +135,19 @@ def run_item_micro_agent(state: LaserState, llm: BaseLanguageModel, enable_feedb
                 "info": info,
             }
 
-        # If we just bought, go to stop in next outer state
-        if (llm_action.get("name") or "").lower() == "buy_now":
-            logging.info("[아이템 마이크로 에이전트] Buy Now 실행 → 종료 라우트")
-            return {
-                "obs": obs_next,
-                "url": None,
-                "last_action": raw_action,
-                "step_count": step_count,
-                "action_history": raw_action_history,
-                "thought_history": thought_history,
-                "current_laser_state": "Stopping",
-                "route": "to_stop",
-                "info": info,
-            }
+        # 정보 도구 클릭 시 추가 정보 저장
+        if action_name in visited:
+            block = f"{action_name}:\n{obs_next.strip()}\n"
+            additional_info.append(block)
 
-        # Otherwise continue inner loop
+        # 다음 루프용 obs 갱신
         obs = obs_next
 
-    # exhausted inner loop → go previous
-    logging.info("[아이템 마이크로 에이전트] 최대 내측 스텝 소진 → 이전 페이지")
+    # 최대 스텝 도달 → Prev로 종료
+    logging.info("[아이템 마이크로 에이전트] 탐색 종료 → Prev")
     obs_next, reward, done, info = toolkit.execute({"name": "previous_page", "arguments": {}})
     obs_next = obs_next or ""
-    raw_action = info.get("predicted_action", "") if "predicted_action" in info else "click[< Prev]"
-
+    raw_action = info.get("predicted_action", "") or "click[< Prev]"
     return {
         "obs": obs_next,
         "url": None,
@@ -188,8 +203,8 @@ def score_item_with_llm(item_info: Dict[str, Any], user_instruction: str, llm: B
         response = llm.invoke(messages)
         logging.info(f"스코어링 LLM 응답: {response.content}")
 
-        # LLM 응답에서 JSON 파싱
-        score_match = re.search(r"{{\s*\"score\"\s*:\s*([\d\.]+)\s*}}", response.content)
+        # LLM 응답에서 JSON 파싱 (단일 중괄호 사용)
+        score_match = re.search(r"{\s*\"score\"\s*:\s*([\d\.]+)\s*}", response.content)
         if score_match:
             score = float(score_match.group(1))
             return max(0.0, min(1.0, score)) # 0.0 ~ 1.0 범위로 제한
@@ -544,18 +559,10 @@ def node_result_space(state: LaserState, llm: BaseLanguageModel, enable_feedback
     llm_action = llm_decision["action"]
     llm_thought = llm_decision["thought"]
     feedback = llm_decision.get("feedback")
-    action_name = llm_action.get("name")
-    action_name_lower = action_name.lower() if action_name else ""
 
-    # 이름 정규화(별칭 → 표준 도구명)
-    alias_to_canonical = {
-        "next": "next_page",
-        "prev": "previous_page",
-        "previous": "previous_page",
-        "buy": "buy_now",
-    }
-    canonical_name = alias_to_canonical.get(action_name_lower, action_name_lower)
-    llm_action = {"name": canonical_name, "arguments": llm_action.get("arguments", {})}
+    llm_action["name"] = (llm_action.get("name") or "").lower()
+
+    action_name_lower = llm_action["name"]
 
     # 2. 결정된 행동을 ToolKit을 통해 실행
     toolkit = ToolKit(state["_env"])
@@ -654,21 +661,15 @@ def node_item_space(state: LaserState, llm: BaseLanguageModel, enable_feedback: 
     llm_action = llm_decision["action"]
     llm_thought = llm_decision["thought"]
     feedback = llm_decision.get("feedback")
-    action_name = llm_action.get("name")
-    action_name_lower = action_name.lower() if action_name else ""
 
     # If enabled, use the small internal loop to better match original behavior
     if ENABLE_ITEM_MICRO_AGENT:
         return run_item_micro_agent(state, llm, enable_feedback)
 
     # 2. 결정된 행동을 ToolKit을 통해 실행
-    alias_to_canonical = {
-        "next": "next_page",
-        "prev": "previous_page",
-        "previous": "previous_page",
-        "buy": "buy_now",
-    }
-    canonical_name = alias_to_canonical.get(action_name_lower, action_name_lower)
+    llm_action["name"] = (llm_action.get("name") or "").lower()
+    canonical_name = llm_action["name"]
+
     toolkit = ToolKit(state["_env"])
     obs, reward, done, info = toolkit.execute({"name": canonical_name, "arguments": llm_action.get("arguments", {})})
     obs = obs or "" # 관찰이 None일 경우 방어
@@ -678,7 +679,7 @@ def node_item_space(state: LaserState, llm: BaseLanguageModel, enable_feedback: 
     logging.info(f"  - 실행된 액션: {raw_action_str}")
 
     # 마지막 스텝이거나 에러 발생 시 즉시 종료
-    if done or info.get("error")):
+    if done or info.get("error"):
         return {
             "obs": obs,
             "url": None,

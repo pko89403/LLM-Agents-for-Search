@@ -26,6 +26,7 @@ class ToolKit:
             "reviews": self._click_reviews,
             "buy_now": self._buy_now,
             "previous_page": self._previous_page,
+            "prev": self._previous_page,
             "next_page": self._next_page,
             "back_to_search": self._back_to_search,
         }

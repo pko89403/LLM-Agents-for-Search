@@ -35,7 +35,7 @@ select_item = {
 }
 
 description = {
-    "name": "Description",
+    "name": "description",
     "description": "Use this function to check the description of the item, if you are unsure if the item perfectly matches the user instruction",
     "parameters": {
         "type": "object",
@@ -45,7 +45,7 @@ description = {
 }
 
 features = {
-    "name": "Features",
+    "name": "features",
     "description": "Use this fucntion to check the features of the item, if you are unsure if the item perfectly matches the user instruction",
     "parameters": {
         "type": "object",
@@ -65,7 +65,7 @@ reviews = {
 }
 
 buy_now = {
-    "name": "Buy_Now",
+    "name": "buy_now",
     "description": "Use this function to buy the current item, if the current item perfectly matches the user instruction.",
     "parameters": {
         "type": "object",
@@ -78,7 +78,7 @@ buy_now = {
 
 
 previous_page = {
-    "name": "Prev",
+    "name": "previous_page",
     "description": "Use this fucntion to go back to the results page, if the current item does not match the user instruction.",
     "parameters": {
         "type": "object",
@@ -88,7 +88,7 @@ previous_page = {
 }
 
 next_page = {
-    "name": "Next",
+    "name": "next_page",
     "description": "Use this function to go to the next page of search results to view more items, if none of the items on the current page match the user instruction.",
     "parameters": {
         "type": "object",
@@ -98,7 +98,7 @@ next_page = {
 }
 
 back_to_search = {
-    "name": "Back_to_Search",
+    "name": "back_to_search",
     "description": "Use this function to go back to the initial search page. You should use this function only if you have browsed mutliple pages of items and checked multiple items' details in the history, and none of the items match the user instruction.",
     "parameters": {
         "type": "object",
