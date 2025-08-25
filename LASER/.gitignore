@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Distribution / packaging
+.eggs/
+*.egg-info/
+dist/
+build/
+wheels/
+*.whl
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Editors and IDEs
+.vscode/        # VS Code
+.idea/          # IntelliJ IDEA
+
+# OS-specific files
+.DS_Store       # macOS
+Thumbs.db       # Windows
+
+# Logs and databases
+*.log
+*.sqlite3
+
+# Environment variables
+.env
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+.ipynb_checkpoints/
+
+# Project-specific temporary/generated files
+tmp_rovodev_batch_eval.py
+sample.json
