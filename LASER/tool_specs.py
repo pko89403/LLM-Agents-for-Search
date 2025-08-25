@@ -55,7 +55,7 @@ features = {
 }
 
 reviews = {
-    "name": "Reviews",
+    "name": "reviews",
     "description": "Use this function to check the reviews of the item, if you are unsure if the item perfectly matches the user instruction",
     "parameters": {
         "type": "object",
