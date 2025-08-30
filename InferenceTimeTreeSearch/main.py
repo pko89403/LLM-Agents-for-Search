@@ -13,14 +13,14 @@ def main():
 
     parser = argparse.ArgumentParser(description="ITTS WebShop 에이전트")
     parser.add_argument("--goal", type=str, help="에이전트의 목표 (예: 'Find a camera under $100')")
-    parser.add_argument("--max-steps", type=int, default=10, help="최대 탐색 깊이 (d)")
-    parser.add_argument("--branching", type=int, default=5, help="브랜치 요소 (b): 액션 및 가치 함수 샘플링 수")
-    parser.add_argument("--budget", type=int, default=64, help="탐색 예산 (c): 최대 노드 확장 수")
-    
+    parser.add_argument("--max-steps", type=int, default=3, help="최대 탐색 깊이 (d)")
+    parser.add_argument("--branching", type=int, default=2, help="브랜치 요소 (b): 액션 및 가치 함수 샘플링 수")
+    parser.add_argument("--budget", type=int, default=5, help="탐색 예산 (c): 최대 노드 확장 수")
+
     args = parser.parse_args()
 
     print("🧠 ITTS WebShop 에이전트 시작")
-    
+
     llm_manager = get_llm_manager()
     client_info = llm_manager.get_client_info()
     print(f"🤖 LLM: {client_info['provider']} - {client_info['model']}")
@@ -49,13 +49,13 @@ def run_demo_mode(max_steps: int, branching: int, budget: int):
     print("\n🎪 데모 모드 실행")
 
 
-    
+
     demo_goals = [
         "Find a durable camera under $100",
         "I need a pair of men's walking shoes, size 10, brand 'Nike'",
         "Find the cheapest laptop with at least 16GB of RAM"
     ]
-    
+
     for i, goal in enumerate(demo_goals, 1):
         print(f"\n--- 데모 {i}: {goal} ---")
         print(f"목표: '{goal}', 최대 스텝: {max_steps}, 브랜칭 팩터: {branching}, 탐색 예산: {budget}")
@@ -70,7 +70,7 @@ def run_demo_mode(max_steps: int, branching: int, budget: int):
 def print_result(result: dict):
     """ITTS 에이전트의 최종 결과를 출력합니다."""
     print("\n✅ 실행 완료!")
-    
+
     best_state = result.get("best_state")
     if best_state:
         print(f"   최고 점수: {result.get('best_score', 0.0):.4f}")
@@ -78,7 +78,7 @@ def print_result(result: dict):
         print("\n--- 최적 경로 ---")
         for i, action in enumerate(best_state.get('action_history', [])):
             print(f"   {i+1}. {action}")
-        
+
         final_answer = result.get('final_answer')
         if final_answer:
             print(f"\n💡 최종 답변: {final_answer}")
