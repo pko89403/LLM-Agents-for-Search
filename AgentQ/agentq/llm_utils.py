@@ -4,8 +4,7 @@ OpenAI, Ollama 등 다양한 LLM 지원
 """
 
 import os
-from typing import Optional, Dict, Any, List
-from typing import Type
+from typing import Optional, Dict, Any, List, Type
 from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
@@ -146,6 +145,38 @@ class LLMManager:
             return resp
         except Exception as e:
             print(f"⚠️ Structured output invoke 실패: {e}")
+            return None
+
+    async def invoke_json_schema_with_system(
+        self,
+        system_prompt: str,
+        user_message: str,
+        json_schema: dict,
+        model_name: Optional[str] = None,
+        **kwargs
+    ) -> Optional[str]:
+        """
+        Ollama의 Structured Outputs(형식 강제)를 이용해 JSON Schema를 강제하여
+        단일 호출을 수행합니다. 성공 시 'raw JSON 문자열'을 반환하고,
+        미지원/실패 시 None을 반환합니다.
+        """
+        model = self.get_model(model_name)
+        try:
+            # LangChain의 ChatOllama는 .bind(format=...) 로 스키마 바인딩을 지원
+            bind = getattr(model, "bind", None)
+            if bind is None:
+                return None
+            schema_bound = bind(format=json_schema)
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_message),
+            ]
+            resp = await schema_bound.ainvoke(messages, **kwargs)
+            raw = (resp.content or "").strip()
+            import json as _json; _json.loads(raw)  # JSON sanity check
+            return raw
+        except Exception as e:
+            print(f"⚠️ JSON-schema 강제 호출 실패: {e}")
             return None
 
 

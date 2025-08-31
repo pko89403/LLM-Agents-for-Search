@@ -34,6 +34,42 @@ def _normalize_cmd(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
+# Ollama JSON Schema for critic ranking
+CRITIC_JSON_SCHEMA = {
+    "oneOf": [
+        {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["cmd", "score"],
+                "properties": {
+                    "cmd": {"type": "string", "minLength": 1},
+                    "score": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+                }
+            }
+        },
+        {
+            "type": "object",
+            "additionalProperties": True,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["cmd", "score"],
+                        "properties": {
+                            "cmd": {"type": "string", "minLength": 1},
+                            "score": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+                        }
+                    }
+                }
+            },
+            "required": ["items"]
+        }
+    ]
+}
 
 def _extract_json_array(text: str):
     import json, re
@@ -66,11 +102,58 @@ def _parse_critic_output(critic_out: str, candidates: list[str]) -> list[tuple[s
             return 0.5
         return 0.0 if v < 0 else 1.0 if v > 1 else v
 
+    # New: handle dict containers and unwrap single-object payloads
+    if isinstance(parsed, dict):
+        # unwrap common containers or single-object payloads
+        if "items" in parsed and isinstance(parsed["items"], list):
+            parsed = parsed["items"]
+        elif "data" in parsed and isinstance(parsed["data"], list):
+            parsed = parsed["data"]
+        elif "choices" in parsed and isinstance(parsed["choices"], list):
+            parsed = parsed["choices"]
+        elif "result" in parsed and isinstance(parsed["result"], list):
+            parsed = parsed["result"]
+        elif ("cmd" in parsed or "command" in parsed or "action" in parsed or "candidate" in parsed or "text" in parsed):
+            parsed = [parsed]
+
     if isinstance(parsed, list):
+        # Fast path A: pure numeric array -> align by index
+        try:
+            if all(isinstance(x, (int, float)) for x in parsed):
+                nums = [clamp01(x) for x in parsed]
+                items = []
+                for i, c in enumerate(cand_norm):
+                    sc = nums[i] if i < len(nums) else 0.5
+                    items.append((c, sc))
+                # convert back to original text forms
+                return [(candidates[i], items[i][1]) for i in range(len(candidates))]
+        except Exception:
+            pass
+
+        # Fast path B: objects with {"index": int, "score": num}
+        try:
+            if all(isinstance(x, dict) and ("index" in x) for x in parsed):
+                idx_map = {}
+                for x in parsed:
+                    try:
+                        idx = int(x.get("index"))
+                        sc = clamp01(x.get("score", 0.5))
+                        idx_map[idx] = sc
+                    except Exception:
+                        continue
+                items = []
+                for i, c in enumerate(cand_norm):
+                    sc = idx_map.get(i, 0.5)
+                    items.append((c, sc))
+                return [(candidates[i], items[i][1]) for i in range(len(candidates))]
+        except Exception:
+            pass
+
         for ent in parsed:
             if isinstance(ent, dict):
                 cmd_key = next((k for k in ent.keys() if k.lower() in ("cmd","command","action","candidate","text")), None)
                 score_key = next((k for k in ent.keys() if k.lower() in ("score","confidence","prob","p")), None)
+                # Use only .get() access for dict fields
                 if cmd_key:
                     cmd = _normalize_cmd(str(ent.get(cmd_key, "")))
                     sc = clamp01(ent.get(score_key, 0.5)) if score_key else 0.5
@@ -106,6 +189,9 @@ def _parse_critic_output(critic_out: str, candidates: list[str]) -> list[tuple[s
         if score is None:
             score = 0.5
         scores_map[c] = float(score)
+    # If no items matched, set uniform 0.5 for all candidates
+    if not items:
+        return [(c, 0.5) for c in candidates]
     return [(c, scores_map[c]) for c in candidates]
 
 
@@ -204,22 +290,115 @@ async def thought_node(state: AgentState) -> Dict[str, Any]:
                         + "\n".join([f"- {c}" for i, c in enumerate(cmds)])
                     )
 
+                    # --- 0) First try: enforce JSON Schema (Ollama structured outputs) ---
                     parsed_scores = None
+                    critic_json_raw = None
+                    try:
+                        critic_json_raw = await llm_manager.invoke_json_schema_with_system(
+                            critic_prompt,
+                            critic_in,
+                            CRITIC_JSON_SCHEMA,
+                            model_name=None  # use default model
+                        )
+                    except Exception as _e0:
+                        print(f"⚠️ Critic JSON-schema invoke 오류: {_e0}")
+
+                    if critic_json_raw:
+                        try:
+                            data = json.loads(critic_json_raw)
+                            # Unwrap common containers or single-object payloads
+                            if isinstance(data, dict):
+                                if "items" in data and isinstance(data["items"], list):
+                                    data = data["items"]
+                                elif "data" in data and isinstance(data["data"], list):
+                                    data = data["data"]
+                                elif "choices" in data and isinstance(data["choices"], list):
+                                    data = data["choices"]
+                                elif "result" in data and isinstance(data["result"], list):
+                                    data = data["result"]
+                                elif any(k in data for k in ("cmd","command","action","candidate","text")):
+                                    data = [data]
+                            critic_out = critic_json_raw  # for logging
+                            norm_map: dict[str, float] = {}
+                            # Case 1: array of objects with cmd/score (ideal)
+                            if isinstance(data, list) and all(isinstance(ent, dict) for ent in data):
+                                for ent in data:
+                                    ncmd = None
+                                    sc = 0.5
+                                    try:
+                                        # tolerate variants, use only .get()
+                                        for k in ("cmd", "command", "action", "candidate", "text"):
+                                            if k in ent and isinstance(ent.get(k), (str, int, float)):
+                                                ncmd = _normalize_cmd(str(ent.get(k)))
+                                                break
+                                        for k in ("score", "confidence", "prob", "p"):
+                                            if k in ent:
+                                                sc = float(ent.get(k))
+                                                break
+                                    except Exception:
+                                        pass
+                                    if ncmd:
+                                        norm_map[ncmd] = max(0.0, min(1.0, sc))
+                                if norm_map:
+                                    parsed_scores = [(c, float(norm_map.get(_normalize_cmd(c), 0.5))) for c in cmds]
+                            # Case 2: array of numbers -> align by index
+                            if not parsed_scores and isinstance(data, list) and all(isinstance(x, (int, float)) for x in data):
+                                nums = [max(0.0, min(1.0, float(x))) for x in data]
+                                parsed_scores = [(c, nums[i] if i < len(nums) else 0.5) for i, c in enumerate(cmds)]
+                            # Case 3: array of {"index": int, "score": num}
+                            if not parsed_scores and isinstance(data, list) and all(isinstance(x, dict) and ("index" in x) for x in data):
+                                idx_map = {}
+                                for x in data:
+                                    try:
+                                        idx = int(x.get("index"))
+                                        sc = max(0.0, min(1.0, float(x.get("score", 0.5))))
+                                        idx_map[idx] = sc
+                                    except Exception:
+                                        continue
+                                parsed_scores = [(c, idx_map.get(i, 0.5)) for i, c in enumerate(cmds)]
+                        except Exception as _ejson:
+                            print(f"⚠️ Critic JSON-schema 파싱 실패: {_ejson}")
+                            parsed_scores = None
 
                     # --- 1) Try structured output (OpenAI etc.) ---
-                    structured = await llm_manager.invoke_structured_with_system(
-                        critic_prompt,
-                        critic_in,
-                        CriticList
-                    )
-                    if structured and getattr(structured, "items", None):
+                    structured = None
+                    if not parsed_scores:
                         try:
-                            parsed_scores = [( _normalize_cmd(it.cmd), float(it.score) ) for it in structured.items]
-                            # Map back to original order; any missing get default 0.5
-                            norm_map = {cmd: sc for cmd, sc in parsed_scores}
-                            parsed_scores = [(c, float(norm_map.get(_normalize_cmd(c), 0.5))) for c in cmds]
+                            structured = await llm_manager.invoke_structured_with_system(
+                                critic_prompt,
+                                critic_in,
+                                CriticList
+                            )
+                        except Exception as _e_struct:
+                            print(f"⚠️ Critic structured invoke 실패: {_e_struct}")
+                            structured = None
+
+                    # Case 1: Pydantic BaseModel 로 반환된 경우만 .items 사용
+                    from pydantic import BaseModel as _PBM
+                    if (not parsed_scores) and isinstance(structured, _PBM):
+                        try:
+                            s_items = getattr(structured, "items", None)
+                            if s_items:
+                                tmp = [(_normalize_cmd(getattr(it, "cmd")), float(getattr(it, "score"))) for it in s_items]
+                                norm_map = {cmd: sc for cmd, sc in tmp}
+                                parsed_scores = [(c, float(norm_map.get(_normalize_cmd(c), 0.5))) for c in cmds]
                         except Exception as _e:
-                            print(f"⚠️ Structured critic 파싱 오류: {_e}")
+                            print(f"⚠️ Structured critic 파싱 오류(BaseModel): {_e}")
+                            parsed_scores = None
+
+                    # Case 2: dict/list/str 로 반환되면 통합 파서에 위임
+                    if (not parsed_scores) and isinstance(structured, (dict, list)):
+                        try:
+                            import json as _json
+                            parsed_scores = _parse_critic_output(_json.dumps(structured), cmds)
+                        except Exception as _e:
+                            print(f"⚠️ Structured critic 파싱 오류(dict/list): {_e}")
+                            parsed_scores = None
+                    elif (not parsed_scores) and isinstance(structured, str):
+                        try:
+                            parsed_scores = _parse_critic_output(structured, cmds)
+                        except Exception as _e:
+                            print(f"⚠️ Structured critic 파싱 오류(str): {_e}")
                             parsed_scores = None
 
                     # --- 2) Fallback: unstructured JSON parsing + one repair retry ---
@@ -243,23 +422,24 @@ async def thought_node(state: AgentState) -> Dict[str, Any]:
                                 parsed_scores = parsed2
                                 critic_out = critic_out2
                     try:
-                        print("   Critic 원본 출력(최종):\n" + (critic_out or "<empty>")[:600])
+                        preview = (critic_out or "<empty>")[:600]
+                        print("   Critic 원본 출력(최종):\n" + preview)
                     except Exception:
                         pass
+
                     if parsed_scores:
                         scores.extend(parsed_scores)
-                    try:
-                        print("   Critic 점수 샘플: " + ", ".join([f"{c}={s:.2f}" for c, s in parsed_scores[:3]]))
-                    except Exception:
-                        pass
-                except Exception as e:
-                    print(f"--- Critic 파싱 실패: {e} ---")
-                    if critic_out:
-                        print(f"--- Critic 원본 출력 ---\n{critic_out}\n--------------------")
-                    if not scores and cmds:
-                        scores = [(c, 0.5) for c in cmds]
+                        try:
+                            sample = ", ".join([f"{c}={s:.2f}" for c, s in parsed_scores[:3]])
+                            print("   Critic 점수 샘플: " + sample)
+                        except Exception:
+                            pass
 
-            # critic 출력이 불완전하면 균등 분배
+                except Exception as e:
+                    print(f"⚠️ Critic/MCTS-lite 블록 오류: {e}")
+                    # 안전 폴백: 비워두면 아래 균등 분배 폴백으로 이어집니다.
+
+            # Single consolidated fallback for empty scores and cmds
             if not scores and cmds:
                 scores = [(c, 0.5) for c in cmds]
 
