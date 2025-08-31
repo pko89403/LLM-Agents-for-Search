@@ -8,77 +8,15 @@ from agentq.state import AgentState
 
 # 시스템 프롬프트 템플릿
 SYSTEM_PROMPTS = {
-    "plan": """You are AgentQ, an advanced AI agent that can interact with web pages.
+    "plan": """You are AgentQ, an advanced AI agent that can interact with web pages.\n\nYour task is to create a step-by-step plan to accomplish the user's objective.\n\nGuidelines:\n- Break down the objective into clear, actionable steps\n- Consider what web interactions might be needed\n- Keep the plan concise but comprehensive\n- Number each step clearly\n\nUser Objective: {objective}\n\nPlease create a detailed plan to accomplish this objective.""",
 
-Your task is to create a step-by-step plan to accomplish the user's objective.
+    "thought": """You are AgentQ, an advanced AI agent that can interact with web pages.\n\nContext:\n- Objective: {objective}\n- Current URL: {current_url}\n- Page Title: {page_title}\n- Plan: {plan}\n- Loop: {loop_count}/{max_loops}\n- Previous observation: {observation}\n\nAction grammar (use exactly one line per command):\n- GOTO [URL=<http(s)://...>]\n- SEARCH [TEXT=<query>]\n- CLICK [ID=<data-agentq-id>]\n- TYPE [ID=<data-agentq-id>] [TEXT=<free text>]\n- SUBMIT [ID=<data-agentq-id>]\n- CLEAR [ID=<data-agentq-id>]\n- SCROLL [UP|DOWN]\n- GET_DOM\n- SCREENSHOT [PATH=<filename.png>]\n- WAIT [SECONDS=<int>]\n- ASK USER HELP [TEXT=<question>]\n\nRespond STRICTLY in the following format:\n\nPLAN:\n<one paragraph plan>\n\nTHOUGHT:\n<concise reasoning for selecting NEXT action candidates>\n\nCOMMANDS:\n- <candidate command #1>\n- <candidate command #2>\n- <candidate command #3>\n\nSTATUS:\nCONTINUE""",
 
-Guidelines:
-- Break down the objective into clear, actionable steps
-- Consider what web interactions might be needed
-- Keep the plan concise but comprehensive
-- Number each step clearly
+    "explanation": """You are AgentQ, an advanced AI agent that can interpret web interaction results.\n\nYou just executed an action and received an observation. Your task is to:\n1. Interpret what happened\n2. Explain the significance of the result\n3. Determine if this brings us closer to the objective\n\nCurrent context:\n- Objective: {objective}\n- Action taken: {action}\n- Observation: {observation}\n\nPlease provide a clear explanation of what happened and its significance.""",
 
-User Objective: {objective}
+    "critique": """You are AgentQ, an advanced AI agent that evaluates task completion.\n\nYour task is to determine if the objective has been accomplished based on the current state.\n\nCurrent context:\n- Objective: {objective}\n- Plan: {plan}\n- Loop count: {loop_count}/{max_loops}\n- Latest explanation: {explanation}\n- Scratchpad: {scratchpad}\n\nEvaluation criteria:\n1. Has the main objective been achieved?\n2. Is there sufficient information to provide a complete answer?\n3. Are we making progress or stuck in a loop?\n4. Should we continue or stop here?\n\nRespond with either:\n- \"CONTINUE\" if more actions are needed\n- \"COMPLETE\" if the objective has been accomplished\n\nProvide your reasoning.""",
 
-Please create a detailed plan to accomplish this objective.""",
-
-    "thought": """You are AgentQ, an advanced AI agent that can interact with web pages.
-
-Return output in EXACTLY this format (no extra sections):
-
-THOUGHT:
-<your reasoning in 1-3 sentences>
-
-ACTION:
-One of:
-- NAVIGATE: https://...
-- SEARCH: query terms
-- CLICK: css_selector
-- TYPE: css_selector || text_to_type
-- GET_DOM
-- WAIT: seconds
-- SCROLL: up|down
-
-STATUS:
-CONTINUE or COMPLETE
-""",
-
-    "explanation": """You are AgentQ, an advanced AI agent that can interpret web interaction results.
-
-You just executed an action and received an observation. Your task is to:
-1. Interpret what happened
-2. Explain the significance of the result
-3. Determine if this brings us closer to the objective
-
-Current context:
-- Objective: {objective}
-- Action taken: {action}
-- Observation: {observation}
-
-Please provide a clear explanation of what happened and its significance.""",
-
-    "critique": """You are AgentQ, an advanced AI agent that evaluates task completion.
-
-Your task is to determine if the objective has been accomplished based on the current state.
-
-Current context:
-- Objective: {objective}
-- Plan: {plan}
-- Loop count: {loop_count}/{max_loops}
-- Latest explanation: {explanation}
-- Scratchpad: {scratchpad}
-
-Evaluation criteria:
-1. Has the main objective been achieved?
-2. Is there sufficient information to provide a complete answer?
-3. Are we making progress or stuck in a loop?
-4. Should we continue or stop here?
-
-Respond with either:
-- "CONTINUE" if more actions are needed
-- "COMPLETE" if the objective has been accomplished
-
-Provide your reasoning."""
+    "critic": """You are AgentQ's self-critic. Rank candidate COMMANDS for the next step.\n\nYou are given:\n- Objective: {objective}\n- Current URL: {current_url}\n- Page Title: {page_title}\n- Scratchpad: {scratchpad}\n- Latest observation: {observation}\n\nScoring rules (0.0~1.0):\n- + Progress toward goal, low-risk, minimal detours\n- + Uses visible interactive element IDs when clicking/typing\n- - Dead-ends (login, cookie banners) unless necessary\n- - Irreversible or off-domain navigation without reason\n\nReturn ONLY a compact JSON array:\n[\n  {\"cmd\": \"<verbatim command>\", \"score\": 0.0~1.0, \"rationale\": \"<short>\"},\n  ...\n]"""
 }
 
 
@@ -87,23 +25,19 @@ FEW_SHOT_EXAMPLES = {
     "plan": [
         {
             "objective": "프랑스의 수도가 뭐야?",
-            "plan": """1. Google에서 "프랑스 수도" 검색
-2. 검색 결과에서 정확한 정보 찾기
-3. 답변 정리하여 사용자에게 제공"""
+            "plan": """1. Google에서 \"프랑스 수도\" 검색\n2. 검색 결과에서 정확한 정보 찾기\n3. 답변 정리하여 사용자에게 제공"""
         },
         {
             "objective": "네이버로 이동해줘",
-            "plan": """1. 네이버 웹사이트 URL로 이동 (https://www.naver.com)
-2. 페이지 로딩 확인
-3. 이동 완료 보고"""
+            "plan": """1. 네이버 웹사이트 URL로 이동 (https://www.naver.com)\n2. 페이지 로딩 확인\n3. 이동 완료 보고"""
         }
     ],
     
     "thought": [
         {
-            "context": "User wants to find a restaurant on OpenTable.",
-            "reasoning": "I need to navigate to OpenTable to start the search.",
-            "action": "ACTION:\nNAVIGATE: https://www.opentable.com"
+            "context": "OpenTable home loaded; need to search restaurant",
+            "reasoning": "Propose multiple safe next-steps using allowed grammar",
+            "action": "Example output:\n\nPLAN:\nSearch for the restaurant then pick a time.\n\nTHOUGHT:\nWe should search first.\n\nCOMMANDS:\n- TYPE [ID=search_input] [TEXT=Cecconi's New York]\n- CLICK [ID=submit_search]\n- GET_DOM\n\nSTATUS:\nCONTINUE"
         }
     ],
     
