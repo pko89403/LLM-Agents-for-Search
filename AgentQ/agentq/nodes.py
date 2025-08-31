@@ -22,7 +22,7 @@ ENABLE_MCTS_LITE = True
 #
 # --- Critic 출력 파싱 유틸 ---
 class CriticItem(BaseModel):
-    cmd: str = Field(..., description="One of the given candidate commands EXACTLY as provided.")
+    index: int = Field(..., ge=0, description="Index of the candidate command (0-based).")
     score: float = Field(..., ge=0.0, le=1.0, description="Confidence 0..1")
 
 class CriticList(BaseModel):
@@ -34,17 +34,21 @@ def _normalize_cmd(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
-# Ollama JSON Schema for critic ranking
+# Ollama JSON Schema for critic ranking (index-based)
 CRITIC_JSON_SCHEMA = {
     "oneOf": [
+        {
+            "type": "array",
+            "items": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+        },
         {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["cmd", "score"],
+                "required": ["index", "score"],
                 "properties": {
-                    "cmd": {"type": "string", "minLength": 1},
+                    "index": {"type": "integer", "minimum": 0},
                     "score": {"type": "number", "minimum": 0.0, "maximum": 1.0}
                 }
             }
@@ -58,9 +62,9 @@ CRITIC_JSON_SCHEMA = {
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
-                        "required": ["cmd", "score"],
+                        "required": ["index", "score"],
                         "properties": {
-                            "cmd": {"type": "string", "minLength": 1},
+                            "index": {"type": "integer", "minimum": 0},
                             "score": {"type": "number", "minimum": 0.0, "maximum": 1.0}
                         }
                     }
@@ -279,165 +283,182 @@ async def thought_node(state: AgentState) -> Dict[str, Any]:
             thought_text = split_output_blocks(raw).get("THOUGHT", "")
 
             if cmds and ENABLE_MCTS_LITE:
+                step = "init"
                 try:
                     critic_out = ""
-                    critic_prompt = prompt_builder.build_critic_prompt(state)
-                    # Include strict instruction that EVERY candidate must appear exactly once
-                    critic_in = (
-                        "You are a ranking critic. For EACH of the following candidate commands, "
-                        "assign a confidence score in [0,1]. Include EVERY candidate exactly once; "
-                        "the `cmd` field must be a verbatim copy.\n\n"
-                        + "\n".join([f"- {c}" for i, c in enumerate(cmds)])
-                    )
-
-                    # --- 0) First try: enforce JSON Schema (Ollama structured outputs) ---
-                    parsed_scores = None
-                    critic_json_raw = None
+                    step = "init"
                     try:
-                        critic_json_raw = await llm_manager.invoke_json_schema_with_system(
-                            critic_prompt,
-                            critic_in,
-                            CRITIC_JSON_SCHEMA,
-                            model_name=None  # use default model
+                        critic_prompt = prompt_builder.build_critic_prompt(state)
+
+                        # Candidates are enumerated and scoring is index-based
+                        critic_in = (
+                            "You are a ranking critic. For EACH candidate command, assign a confidence score in [0,1]. "
+                            "Return ONLY one of the following JSON formats with NO prose:\n"
+                            "1) A JSON array of numbers of length N (N = number of candidates), where element i is the score for candidate i.\n"
+                            "2) A JSON array of objects {\"index\": <int 0..N-1>, \"score\": <float 0..1>} covering EVERY candidate exactly once.\n\n"
+                            "Candidates (0-based):\n" + "\n".join([f"[{i}] {c}" for i, c in enumerate(cmds)])
                         )
-                    except Exception as _e0:
-                        print(f"⚠️ Critic JSON-schema invoke 오류: {_e0}")
 
-                    if critic_json_raw:
+                        # --- 0) First try: enforce JSON Schema (Ollama structured outputs) ---
+                        parsed_scores = None
+                        critic_json_raw = None
+                        step = "json_schema_invoke"
                         try:
-                            data = json.loads(critic_json_raw)
-                            # Unwrap common containers or single-object payloads
-                            if isinstance(data, dict):
-                                if "items" in data and isinstance(data["items"], list):
-                                    data = data["items"]
-                                elif "data" in data and isinstance(data["data"], list):
-                                    data = data["data"]
-                                elif "choices" in data and isinstance(data["choices"], list):
-                                    data = data["choices"]
-                                elif "result" in data and isinstance(data["result"], list):
-                                    data = data["result"]
-                                elif any(k in data for k in ("cmd","command","action","candidate","text")):
-                                    data = [data]
-                            critic_out = critic_json_raw  # for logging
-                            norm_map: dict[str, float] = {}
-                            # Case 1: array of objects with cmd/score (ideal)
-                            if isinstance(data, list) and all(isinstance(ent, dict) for ent in data):
-                                for ent in data:
-                                    ncmd = None
-                                    sc = 0.5
-                                    try:
-                                        # tolerate variants, use only .get()
-                                        for k in ("cmd", "command", "action", "candidate", "text"):
-                                            if k in ent and isinstance(ent.get(k), (str, int, float)):
-                                                ncmd = _normalize_cmd(str(ent.get(k)))
-                                                break
-                                        for k in ("score", "confidence", "prob", "p"):
-                                            if k in ent:
-                                                sc = float(ent.get(k))
-                                                break
-                                    except Exception:
-                                        pass
-                                    if ncmd:
-                                        norm_map[ncmd] = max(0.0, min(1.0, sc))
-                                if norm_map:
-                                    parsed_scores = [(c, float(norm_map.get(_normalize_cmd(c), 0.5))) for c in cmds]
-                            # Case 2: array of numbers -> align by index
-                            if not parsed_scores and isinstance(data, list) and all(isinstance(x, (int, float)) for x in data):
-                                nums = [max(0.0, min(1.0, float(x))) for x in data]
-                                parsed_scores = [(c, nums[i] if i < len(nums) else 0.5) for i, c in enumerate(cmds)]
-                            # Case 3: array of {"index": int, "score": num}
-                            if not parsed_scores and isinstance(data, list) and all(isinstance(x, dict) and ("index" in x) for x in data):
-                                idx_map = {}
-                                for x in data:
-                                    try:
-                                        idx = int(x.get("index"))
-                                        sc = max(0.0, min(1.0, float(x.get("score", 0.5))))
-                                        idx_map[idx] = sc
-                                    except Exception:
-                                        continue
-                                parsed_scores = [(c, idx_map.get(i, 0.5)) for i, c in enumerate(cmds)]
-                        except Exception as _ejson:
-                            print(f"⚠️ Critic JSON-schema 파싱 실패: {_ejson}")
-                            parsed_scores = None
-
-                    # --- 1) Try structured output (OpenAI etc.) ---
-                    structured = None
-                    if not parsed_scores:
-                        try:
-                            structured = await llm_manager.invoke_structured_with_system(
+                            critic_json_raw = await llm_manager.invoke_json_schema_with_system(
                                 critic_prompt,
                                 critic_in,
-                                CriticList
+                                CRITIC_JSON_SCHEMA,
+                                model_name=None  # use default model
                             )
-                        except Exception as _e_struct:
-                            print(f"⚠️ Critic structured invoke 실패: {_e_struct}")
-                            structured = None
+                        except Exception as _e0:
+                            import traceback as _tb
+                            print(f"⚠️ Critic JSON-schema invoke 오류: {_e0}")
+                            _tb.print_exc()
 
-                    # Case 1: Pydantic BaseModel 로 반환된 경우만 .items 사용
-                    from pydantic import BaseModel as _PBM
-                    if (not parsed_scores) and isinstance(structured, _PBM):
-                        try:
-                            s_items = getattr(structured, "items", None)
-                            if s_items:
-                                tmp = [(_normalize_cmd(getattr(it, "cmd")), float(getattr(it, "score"))) for it in s_items]
-                                norm_map = {cmd: sc for cmd, sc in tmp}
-                                parsed_scores = [(c, float(norm_map.get(_normalize_cmd(c), 0.5))) for c in cmds]
-                        except Exception as _e:
-                            print(f"⚠️ Structured critic 파싱 오류(BaseModel): {_e}")
-                            parsed_scores = None
-
-                    # Case 2: dict/list/str 로 반환되면 통합 파서에 위임
-                    if (not parsed_scores) and isinstance(structured, (dict, list)):
-                        try:
-                            import json as _json
-                            parsed_scores = _parse_critic_output(_json.dumps(structured), cmds)
-                        except Exception as _e:
-                            print(f"⚠️ Structured critic 파싱 오류(dict/list): {_e}")
-                            parsed_scores = None
-                    elif (not parsed_scores) and isinstance(structured, str):
-                        try:
-                            parsed_scores = _parse_critic_output(structured, cmds)
-                        except Exception as _e:
-                            print(f"⚠️ Structured critic 파싱 오류(str): {_e}")
-                            parsed_scores = None
-
-                    # --- 2) Fallback: unstructured JSON parsing + one repair retry ---
-                    if not parsed_scores:
-                        critic_out = await llm_manager.invoke_with_system(critic_prompt, critic_in)
-                        parsed_scores = _parse_critic_output(critic_out, cmds)
-                        need_retry = (not parsed_scores) or all(abs(s - 0.5) < 1e-6 for _, s in parsed_scores)
-                        if need_retry:
-                            repair_user = (
-                                "Your previous output was INVALID. Return ONLY a JSON array where each item is:\n"
-                                "{\"cmd\": \"<one of the given candidates EXACTLY>\", \"score\": <float 0..1>}\n"
-                                "Do NOT include any explanation or code fences. Include EVERY candidate exactly once.\n\n"
-                                "Candidates (copy verbatim):\n" + "\n".join([f"- {c}" for c in cmds])
-                            )
-                            critic_out2 = await llm_manager.invoke_with_system(critic_prompt, repair_user)
+                        if critic_json_raw:
+                            step = "json_schema_parse"
                             try:
-                                parsed2 = _parse_critic_output(critic_out2, cmds)
-                            except Exception:
-                                parsed2 = None
-                            if parsed2:
-                                parsed_scores = parsed2
-                                critic_out = critic_out2
-                    try:
-                        preview = (critic_out or "<empty>")[:600]
-                        print("   Critic 원본 출력(최종):\n" + preview)
-                    except Exception:
-                        pass
+                                data = critic_json_raw
+                                if not isinstance(data, (dict, list)):
+                                    data = json.loads(critic_json_raw)
 
-                    if parsed_scores:
-                        scores.extend(parsed_scores)
+                                # Unwrap common containers
+                                if isinstance(data, dict):
+                                    if "items" in data and isinstance(data["items"], list):
+                                        data = data["items"]
+                                    elif "data" in data and isinstance(data["data"], list):
+                                        data = data["data"]
+                                    elif "choices" in data and isinstance(data["choices"], list):
+                                        data = data["choices"]
+                                    elif "result" in data and isinstance(data["result"], list):
+                                        data = data["result"]
+                                    elif any(k in data for k in ("index","score","cmd","command","action","candidate","text")):
+                                        data = [data]
+
+                                critic_out = critic_json_raw if isinstance(critic_json_raw, str) else json.dumps(critic_json_raw)
+
+                                # Only allow index-based scoring
+                                # Case 1: array of numbers -> align by index
+                                if isinstance(data, list) and all(isinstance(x, (int, float)) for x in data):
+                                    nums = [max(0.0, min(1.0, float(x))) for x in data]
+                                    parsed_scores = [(c, nums[i] if i < len(nums) else 0.5) for i, c in enumerate(cmds)]
+
+                                # Case 2: array of {"index": int, "score": num}
+                                if not parsed_scores and isinstance(data, list) and all(isinstance(x, dict) and ("index" in x) for x in data):
+                                    idx_map = {}
+                                    for x in data:
+                                        try:
+                                            idx = int(x.get("index"))
+                                            sc = max(0.0, min(1.0, float(x.get("score", 0.5))))
+                                            idx_map[idx] = sc
+                                        except Exception:
+                                            continue
+                                    parsed_scores = [(c, idx_map.get(i, 0.5)) for i, c in enumerate(cmds)]
+                            except Exception as _ejson:
+                                import traceback as _tb
+                                print(f"⚠️ Critic JSON-schema 파싱 실패: {_ejson}")
+                                _tb.print_exc()
+                                parsed_scores = None
+
+                        # --- 1) Try structured output (OpenAI etc.) ---
+                        step = "structured_invoke"
+                        structured = None
+                        if not parsed_scores:
+                            try:
+                                structured = await llm_manager.invoke_structured_with_system(
+                                    critic_prompt,
+                                    critic_in,
+                                    CriticList
+                                )
+                            except Exception as _e_struct:
+                                import traceback as _tb
+                                print(f"⚠️ Critic structured invoke 실패: {_e_struct}")
+                                _tb.print_exc()
+                                structured = None
+
+                        from pydantic import BaseModel as _PBM
+                        if (not parsed_scores) and isinstance(structured, _PBM):
+                            step = "structured_parse_basemodel"
+                            try:
+                                s_items = getattr(structured, "items", None)
+                                if s_items:
+                                    idx_map = {int(getattr(it, "index")): float(getattr(it, "score")) for it in s_items}
+                                    parsed_scores = [(c, float(idx_map.get(i, 0.5))) for i, c in enumerate(cmds)]
+                            except Exception as _e:
+                                import traceback as _tb
+                                print(f"⚠️ Structured critic 파싱 오류(BaseModel): {_e}")
+                                _tb.print_exc()
+                                parsed_scores = None
+
+                        if (not parsed_scores) and isinstance(structured, (dict, list)):
+                            step = "structured_parse_dictlist"
+                            try:
+                                critic_out = json.dumps(structured)
+                                parsed_scores = _parse_critic_output(critic_out, cmds)
+                            except Exception as _e:
+                                import traceback as _tb
+                                print(f"⚠️ Structured critic 파싱 오류(dict/list): {_e}")
+                                _tb.print_exc()
+                                parsed_scores = None
+                        elif (not parsed_scores) and isinstance(structured, str):
+                            step = "structured_parse_str"
+                            try:
+                                critic_out = structured
+                                parsed_scores = _parse_critic_output(critic_out, cmds)
+                            except Exception as _e:
+                                import traceback as _tb
+                                print(f"⚠️ Structured critic 파싱 오류(str): {_e}")
+                                _tb.print_exc()
+                                parsed_scores = None
+
+                        # --- 2) Fallback: unstructured JSON parsing + one repair retry ---
+                        if not parsed_scores:
+                            step = "fallback_invoke"
+                            critic_out = await llm_manager.invoke_with_system(critic_prompt, critic_in)
+                            step = "fallback_parse"
+                            parsed_scores = _parse_critic_output(critic_out, cmds)
+                            need_retry = (not parsed_scores) or all(abs(s - 0.5) < 1e-6 for _, s in parsed_scores)
+                            if need_retry:
+                                step = "fallback_repair"
+                                repair_user = (
+                                    "Your previous output was INVALID. Return ONLY ONE of the following JSON formats with NO prose:\n"
+                                    "1) A JSON array of numbers of length N (scores for candidates 0..N-1), or\n"
+                                    "2) A JSON array of objects {\"index\": <int 0..N-1>, \"score\": <float 0..1>} that covers EVERY candidate exactly once.\n"
+                                    "Do NOT include code fences or explanations. Candidates are enumerated 0..N-1 as given previously."
+                                )
+                                critic_out2 = await llm_manager.invoke_with_system(critic_prompt, repair_user)
+                                try:
+                                    parsed2 = _parse_critic_output(critic_out2, cmds)
+                                except Exception:
+                                    parsed2 = None
+                                if parsed2:
+                                    parsed_scores = parsed2
+                                    critic_out = critic_out2
+
+                        # --- Logging ---
                         try:
-                            sample = ", ".join([f"{c}={s:.2f}" for c, s in parsed_scores[:3]])
-                            print("   Critic 점수 샘플: " + sample)
+                            preview = (critic_out or "<empty>")[:600]
+                            print("   Critic 원본 출력(최종):\n" + preview)
+                            print(f"   [디버그] step = {step}, type(structured) = {type(structured).__name__}")
                         except Exception:
                             pass
 
-                except Exception as e:
-                    print(f"⚠️ Critic/MCTS-lite 블록 오류: {e}")
-                    # 안전 폴백: 비워두면 아래 균등 분배 폴백으로 이어집니다.
+                        if parsed_scores:
+                            scores.extend(parsed_scores)
+                            try:
+                                sample = ", ".join([f"{c}={s:.2f}" for c, s in parsed_scores[:3]])
+                                print("   Critic 점수 샘플: " + sample)
+                            except Exception:
+                                pass
+                    except Exception as e_inner:
+                        import traceback as _tb
+                        print(f"⚠️ Critic/MCTS-lite 내부 오류(step={step}): {e_inner}")
+                        _tb.print_exc()
+                        # 안전 폴백: 아래 균등 분배 폴백으로 이어짐
+                except Exception as e_outer:
+                    import traceback as _tb
+                    print(f"⚠️ Critic/MCTS-lite 블록 오류(outer): {e_outer}")
+                    _tb.print_exc()
 
             # Single consolidated fallback for empty scores and cmds
             if not scores and cmds:

@@ -165,6 +165,13 @@ def parse_command_line(cmd: str):
     m = re.match(r'^(?:GOTO|GO TO|NAVIGATE)\s*\[\s*URL\s*=\s*<([^>\]]+)>\s*\]\s*$', c, re.I)
     if m:
         return {"type": "NAVIGATE", "target": m.group(1).strip()}
+    # NAVIGATE / GOTO (tolerant forms without angle brackets)
+    m = re.match(r'^(?:GOTO|GO TO|NAVIGATE)\s*\[\s*URL\s*=\s*([^\]\s]+)\s*\]\s*$', c, re.I)
+    if m:
+        return {"type": "NAVIGATE", "target": m.group(1).strip()}
+    m = re.match(r'^(?:GOTO|GO TO|NAVIGATE)\s+(https?://\S+)\s*$', c, re.I)
+    if m:
+        return {"type": "NAVIGATE", "target": m.group(1).strip()}
     m = re.match(r'^(?:NAVIGATE|GOTO)\s*:\s*(.+)$', c, re.I)
     if m:
         return {"type": "NAVIGATE", "target": m.group(1).strip()}
