@@ -16,7 +16,30 @@ SYSTEM_PROMPTS = {
 
     "critique": """You are AgentQ, an advanced AI agent that evaluates task completion.\n\nYour task is to determine if the objective has been accomplished based on the current state.\n\nCurrent context:\n- Objective: {objective}\n- Plan: {plan}\n- Loop count: {loop_count}/{max_loops}\n- Latest explanation: {explanation}\n- Scratchpad: {scratchpad}\n\nEvaluation criteria:\n1. Has the main objective been achieved?\n2. Is there sufficient information to provide a complete answer?\n3. Are we making progress or stuck in a loop?\n4. Should we continue or stop here?\n\nRespond with either:\n- \"CONTINUE\" if more actions are needed\n- \"COMPLETE\" if the objective has been accomplished\n\nProvide your reasoning.""",
 
-    "critic": """You are AgentQ's self-critic. Rank candidate COMMANDS for the next step.\n\nYou are given:\n- Objective: {objective}\n- Current URL: {current_url}\n- Page Title: {page_title}\n- Scratchpad: {scratchpad}\n- Latest observation: {observation}\n\nScoring rules (0.0~1.0):\n- + Progress toward goal, low-risk, minimal detours\n- + Uses visible interactive element IDs when clicking/typing\n- - Dead-ends (login, cookie banners) unless necessary\n- - Irreversible or off-domain navigation without reason\n\nReturn ONLY a compact JSON array:\n[\n  {\"cmd\": \"<verbatim command>\", \"score\": 0.0~1.0, \"rationale\": \"<short>\"},\n  ...\n]"""
+    "critic": """You are AgentQ's self-critic. Rank candidate COMMANDS for the next step.
+
+You are given:
+- Objective: {objective}
+- Current URL: {current_url}
+- Page Title: {page_title}
+- Scratchpad: {scratchpad}
+- Latest observation: {observation}
+
+Scoring rules (0.0~1.0):
+- + Progress toward goal, low-risk, minimal detours
+- + Uses visible interactive element IDs when clicking/typing
+- - Dead-ends (login, cookie banners) unless necessary
+- - Irreversible or off-domain navigation without reason
+
+STRICT OUTPUT CONTRACT — READ CAREFULLY:
+- Return ONLY a JSON array. No prose, no code fences, no trailing text.
+- Each item MUST be: {"cmd": "<exactly one of the given candidates>", "score": <float between 0 and 1>}.
+- Include EVERY candidate EXACTLY ONCE. Do NOT invent or drop commands.
+- The "cmd" must be a verbatim copy of the candidate line, including spacing.
+- Use higher scores for better candidates.
+
+Return ONLY the JSON array, e.g.:
+[{"cmd": "GOTO [URL=https://example.com]", "score": 0.72}, {"cmd": "GET_DOM", "score": 0.41}]"""
 }
 
 
@@ -32,7 +55,7 @@ FEW_SHOT_EXAMPLES = {
             "plan": """1. 네이버 웹사이트 URL로 이동 (https://www.naver.com)\n2. 페이지 로딩 확인\n3. 이동 완료 보고"""
         }
     ],
-    
+
     "thought": [
         {
             "context": "OpenTable home loaded; need to search restaurant",
@@ -40,7 +63,7 @@ FEW_SHOT_EXAMPLES = {
             "action": "Example output:\n\nPLAN:\nSearch for the restaurant then pick a time.\n\nTHOUGHT:\nWe should search first.\n\nCOMMANDS:\n- TYPE [ID=search_input] [TEXT=Cecconi's New York]\n- CLICK [ID=submit_search]\n- GET_DOM\n\nSTATUS:\nCONTINUE"
         }
     ],
-    
+
     "explanation": [
         {
             "action": "SEARCH: 프랑스 수도",
@@ -48,7 +71,7 @@ FEW_SHOT_EXAMPLES = {
             "explanation": "Google 검색을 통해 프랑스의 수도가 파리라는 정보를 성공적으로 찾았습니다. 이는 사용자의 질문에 대한 정확한 답변을 제공할 수 있는 충분한 정보입니다."
         }
     ],
-    
+
     "critique": [
         {
             "objective": "프랑스의 수도가 뭐야?",
@@ -64,7 +87,7 @@ def get_system_prompt(prompt_type: str, **kwargs) -> str:
     """시스템 프롬프트 가져오기"""
     if prompt_type not in SYSTEM_PROMPTS:
         raise ValueError(f"Unknown prompt type: {prompt_type}")
-    
+
     template = SYSTEM_PROMPTS[prompt_type]
     return template.format(**kwargs)
 
@@ -73,9 +96,9 @@ def get_few_shot_examples(prompt_type: str, num_examples: int = 2) -> str:
     """Few-shot 예제 가져오기"""
     if prompt_type not in FEW_SHOT_EXAMPLES:
         return ""
-    
+
     examples = FEW_SHOT_EXAMPLES[prompt_type][:num_examples]
-    
+
     if prompt_type == "plan":
         return "\n\n".join([
             f"Example:\nObjective: {ex['objective']}\nPlan:\n{ex['plan']}"
@@ -96,26 +119,26 @@ def get_few_shot_examples(prompt_type: str, num_examples: int = 2) -> str:
             f"Example:\nObjective: {ex['objective']}\nExplanation: {ex['explanation']}\nDecision: {ex['decision']}\nReasoning: {ex['reasoning']}"
             for ex in examples
         ])
-    
+
     return ""
 
 
 def build_prompt_with_examples(prompt_type: str, include_examples: bool = True, **kwargs) -> str:
     """예제를 포함한 프롬프트 구성"""
     system_prompt = get_system_prompt(prompt_type, **kwargs)
-    
+
     if include_examples:
         examples = get_few_shot_examples(prompt_type)
         if examples:
             system_prompt += f"\n\nHere are some examples:\n{examples}\n\nNow, please respond to the current situation:"
-    
+
     return system_prompt
 
 
 def format_state_for_prompt(state: AgentState) -> Dict[str, str]:
     """AgentState를 프롬프트용 딕셔너리로 변환"""
     from agentq.state import get_scratchpad_content
-    
+
     return {
         "objective": state["objective"],
         "plan": state["plan"] or "No plan yet",

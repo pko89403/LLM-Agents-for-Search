@@ -3,6 +3,7 @@
 """
 
 from typing import Dict, Any
+from pydantic import BaseModel, Field
 from agentq.state import AgentState, increment_loop_count, add_error, clear_error
 from agentq.llm_utils import get_llm_manager
 from agentq.prompt_utils import (
@@ -17,6 +18,103 @@ import json
 # 릴리즈 토글/가드
 ENABLE_CRITIC = True
 ENABLE_MCTS_LITE = True
+
+#
+# --- Critic 출력 파싱 유틸 ---
+class CriticItem(BaseModel):
+    cmd: str = Field(..., description="One of the given candidate commands EXACTLY as provided.")
+    score: float = Field(..., ge=0.0, le=1.0, description="Confidence 0..1")
+
+class CriticList(BaseModel):
+    items: list[CriticItem]
+def _normalize_cmd(s: str) -> str:
+    import re
+    s = (s or "").strip()
+    s = s.strip('`"\' ')
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _extract_json_array(text: str):
+    import json, re
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    try:
+        m = re.search(r"\[[\s\S]*\]", text)
+        if m:
+            return json.loads(m.group(0))
+    except Exception:
+        return None
+    return None
+
+
+def _parse_critic_output(critic_out: str, candidates: list[str]) -> list[tuple[str, float]]:
+    import re
+    cand_norm = [_normalize_cmd(c) for c in candidates]
+    parsed = _extract_json_array(critic_out)
+    print(f"--- CRITIC PARSER: parsed = {parsed} ---")
+    items: list[tuple[str, float]] = []
+
+    def clamp01(x):
+        try:
+            v = float(x)
+        except Exception:
+            return 0.5
+        return 0.0 if v < 0 else 1.0 if v > 1 else v
+
+    if isinstance(parsed, list):
+        for ent in parsed:
+            if isinstance(ent, dict):
+                cmd_key = next((k for k in ent.keys() if k.lower() in ("cmd","command","action","candidate","text")), None)
+                score_key = next((k for k in ent.keys() if k.lower() in ("score","confidence","prob","p")), None)
+                if cmd_key:
+                    cmd = _normalize_cmd(str(ent.get(cmd_key, "")))
+                    sc = clamp01(ent.get(score_key, 0.5)) if score_key else 0.5
+                    if cmd:
+                        items.append((cmd, sc))
+            elif isinstance(ent, list) and len(ent) >= 1:
+                cmd = _normalize_cmd(str(ent[0]))
+                sc = clamp01(ent[1]) if len(ent) >= 2 else 0.5
+                if cmd:
+                    items.append((cmd, sc))
+            elif isinstance(ent, str):
+                cmd = _normalize_cmd(ent)
+                if cmd:
+                    items.append((cmd, 0.5))
+
+    scores_map: dict[str, float] = {}
+    for i, c in enumerate(candidates):
+        cn = cand_norm[i]
+        score = None
+        for cmd, sc in items:
+            n = _normalize_cmd(cmd)
+            if n == cn:
+                score = sc; break
+        if score is None:
+            for cmd, sc in items:
+                if _normalize_cmd(cmd).casefold() == cn.casefold():
+                    score = sc; break
+        if score is None:
+            for cmd, sc in items:
+                n = _normalize_cmd(cmd)
+                if n and (n in cn or cn in n):
+                    score = sc; break
+        if score is None:
+            score = 0.5
+        scores_map[c] = float(score)
+    return [(c, scores_map[c]) for c in candidates]
+
+
+def _progress_fingerprint(state: AgentState) -> str:
+    from hashlib import md5
+    url = (state.get("current_url") or "")
+    title = (state.get("page_title") or "")
+    content = (state.get("page_content") or "")[:1000]
+    return md5(f"{url}|{title}|{content}".encode("utf-8")).hexdigest()
 
 
 async def plan_node(state: AgentState) -> Dict[str, Any]:
@@ -57,7 +155,7 @@ async def plan_node(state: AgentState) -> Dict[str, Any]:
 async def thought_node(state: AgentState) -> Dict[str, Any]:
     """Thought 노드: 후보 생성 → critic 점수화 → 최종 액션 선택"""
     print(f"🤔 Thought 노드 실행 중... (루프 {state['loop_count'] + 1})")
-    
+
     try:
         # 루프 카운트 증가
         state = increment_loop_count(state)
@@ -74,13 +172,14 @@ async def thought_node(state: AgentState) -> Dict[str, Any]:
 
         prompt_builder = get_prompt_builder()
         llm_manager = get_llm_manager()
-        
+
         action = None
         thought_text = ""
         cmds = []
         status = "CONTINUE"
         best_cmd = None
         scores = []
+        critic_out = "" # Initialize critic_out
 
         if ENABLE_CRITIC:
             # 후보 커맨드 생성 (복잡한 프롬프트 사용)
@@ -92,39 +191,74 @@ async def thought_node(state: AgentState) -> Dict[str, Any]:
             raw = clean_response(resp)
             cmds, status = extract_commands_and_status(raw)
             thought_text = split_output_blocks(raw).get("THOUGHT", "")
-            
+
             if cmds and ENABLE_MCTS_LITE:
                 try:
-                    # critic으로 랭킹
+                    critic_out = ""
                     critic_prompt = prompt_builder.build_critic_prompt(state)
-                    critic_in = "Rank these commands:\n" + "\n".join([f"{i+1}. {c}" for i,c in enumerate(cmds)])
-                    critic_out = await llm_manager.invoke_with_system(critic_prompt, critic_in)
-                    
-                    # LLM이 생성한 JSON 앞뒤의 불필요한 텍스트(예: ```json ... ```)를 제거합니다.
-                    match = re.search(r'\[.*?\]', critic_out, re.DOTALL)
-                    json_str = match.group(0) if match else critic_out
-                    
-                    parsed = json.loads(json_str)
-                    
-                    if isinstance(parsed, list):
-                        for p in parsed:
-                            if isinstance(p, dict):
-                                # 'cmd' 또는 '"cmd"'와 같이 따옴표가 포함된 키도 처리합니다.
-                                cmd_key = next((k for k in p if 'cmd' in k), None)
-                                score_key = next((k for k in p if 'score' in k), None)
-                                
-                                if cmd_key and score_key:
-                                    cmd = p[cmd_key]
-                                    score = float(p[score_key])
-                                    scores.append((cmd, score))
+                    # Include strict instruction that EVERY candidate must appear exactly once
+                    critic_in = (
+                        "You are a ranking critic. For EACH of the following candidate commands, "
+                        "assign a confidence score in [0,1]. Include EVERY candidate exactly once; "
+                        "the `cmd` field must be a verbatim copy.\n\n"
+                        + "\n".join([f"- {c}" for i, c in enumerate(cmds)])
+                    )
 
+                    parsed_scores = None
+
+                    # --- 1) Try structured output (OpenAI etc.) ---
+                    structured = await llm_manager.invoke_structured_with_system(
+                        critic_prompt,
+                        critic_in,
+                        CriticList
+                    )
+                    if structured and getattr(structured, "items", None):
+                        try:
+                            parsed_scores = [( _normalize_cmd(it.cmd), float(it.score) ) for it in structured.items]
+                            # Map back to original order; any missing get default 0.5
+                            norm_map = {cmd: sc for cmd, sc in parsed_scores}
+                            parsed_scores = [(c, float(norm_map.get(_normalize_cmd(c), 0.5))) for c in cmds]
+                        except Exception as _e:
+                            print(f"⚠️ Structured critic 파싱 오류: {_e}")
+                            parsed_scores = None
+
+                    # --- 2) Fallback: unstructured JSON parsing + one repair retry ---
+                    if not parsed_scores:
+                        critic_out = await llm_manager.invoke_with_system(critic_prompt, critic_in)
+                        parsed_scores = _parse_critic_output(critic_out, cmds)
+                        need_retry = (not parsed_scores) or all(abs(s - 0.5) < 1e-6 for _, s in parsed_scores)
+                        if need_retry:
+                            repair_user = (
+                                "Your previous output was INVALID. Return ONLY a JSON array where each item is:\n"
+                                "{\"cmd\": \"<one of the given candidates EXACTLY>\", \"score\": <float 0..1>}\n"
+                                "Do NOT include any explanation or code fences. Include EVERY candidate exactly once.\n\n"
+                                "Candidates (copy verbatim):\n" + "\n".join([f"- {c}" for c in cmds])
+                            )
+                            critic_out2 = await llm_manager.invoke_with_system(critic_prompt, repair_user)
+                            try:
+                                parsed2 = _parse_critic_output(critic_out2, cmds)
+                            except Exception:
+                                parsed2 = None
+                            if parsed2:
+                                parsed_scores = parsed2
+                                critic_out = critic_out2
+                    try:
+                        print("   Critic 원본 출력(최종):\n" + (critic_out or "<empty>")[:600])
+                    except Exception:
+                        pass
+                    if parsed_scores:
+                        scores.extend(parsed_scores)
+                    try:
+                        print("   Critic 점수 샘플: " + ", ".join([f"{c}={s:.2f}" for c, s in parsed_scores[:3]]))
+                    except Exception:
+                        pass
                 except Exception as e:
                     print(f"--- Critic 파싱 실패: {e} ---")
-                    print(f"--- Critic 원본 출력 ---\n{critic_out}\n--------------------")
-                    # 파싱 실패 시, 후보들에게 균등한 점수를 부여하여 로직을 계속 진행합니다.
+                    if critic_out:
+                        print(f"--- Critic 원본 출력 ---\n{critic_out}\n--------------------")
                     if not scores and cmds:
                         scores = [(c, 0.5) for c in cmds]
-            
+
             # critic 출력이 불완전하면 균등 분배
             if not scores and cmds:
                 scores = [(c, 0.5) for c in cmds]
@@ -141,6 +275,11 @@ async def thought_node(state: AgentState) -> Dict[str, Any]:
                     total = alpha * s + (1 - alpha) * q + bonus
                     scored.append((total, c))
                 scored.sort(reverse=True)
+                try:
+                    preview = ", ".join([f"{c}~{t:.2f}" for t, c in sorted(scored, reverse=True)[:3]])
+                    print(f"   UCB-lite 상위: {preview}")
+                except Exception:
+                    pass
                 best_cmd = scored[0][1]
                 action = parse_command_line(best_cmd)
             else:
@@ -177,12 +316,12 @@ async def thought_node(state: AgentState) -> Dict[str, Any]:
         if action:
             state = ScratchpadManager.add_action(state, action)
 
-        print(f"   사고 과정: {state["thought"][:100]}...")
+        print(f"   사고 과정: {state['thought'][:100]}...")
         if action:
             print(f"   계획된 액션: {action.get('type')}")
         else:
             print("   액션이 추출되지 않았습니다.")
-        
+
         return {
             "thought": state["thought"],
             "action": action,
@@ -314,6 +453,27 @@ async def critique_node(state: AgentState) -> Dict[str, Any]:
         # 완료 여부 결정
         done = extract_critique_decision(response)
 
+        # ---- 진행도/루프 가드 ----
+        loops = state.get("loop_count", 0)
+        min_loops = state.get("min_loops", 3)
+
+        prev_fp = state.get("last_progress_fingerprint")
+        curr_fp = _progress_fingerprint(state)
+        progress_gain = (prev_fp != curr_fp) and bool(curr_fp)
+
+        if progress_gain:
+            state["no_progress_streak"] = 0
+            state["last_progress_fingerprint"] = curr_fp
+        else:
+            state["no_progress_streak"] = state.get("no_progress_streak", 0) + 1
+
+        if loops < min_loops:
+            done = False
+
+        if state.get("no_progress_streak", 0) >= 2 and loops >= min_loops:
+            done = True
+            critique += "\nHeuristic: No progress for multiple steps → stopping."
+
         # 도메인 휴리스틱 (OpenTable)
         try:
             url = state.get("current_url") or ""
@@ -333,7 +493,7 @@ async def critique_node(state: AgentState) -> Dict[str, Any]:
                 if cmd:
                     stats = state.get("q_stats") or {}
                     ent = stats.get(cmd, {"Q": 0.0, "N": 0})
-                    reward = 1.0 if done else 0.0
+                    reward = 1.0 if done else (0.2 if progress_gain else 0.0)
                     ent["N"] += 1
                     ent["Q"] = ent["Q"] + (reward - ent["Q"]) / ent["N"]
                     stats[cmd] = ent
@@ -345,6 +505,8 @@ async def critique_node(state: AgentState) -> Dict[str, Any]:
         if state["loop_count"] >= state["max_loops"]:
             done = True
             critique += f"\n최대 루프 횟수({state['max_loops']})에 도달하여 종료합니다."
+
+        print(f"   루프 {loops}, min_loops {min_loops}, no_progress_streak {state.get('no_progress_streak')}, done={done}")
 
         # 상태 업데이트
         state["done"] = done
