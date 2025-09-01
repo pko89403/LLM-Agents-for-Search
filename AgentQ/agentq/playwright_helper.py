@@ -503,3 +503,82 @@ async def get_dom_snapshot():
     except Exception as e:
         print(f"❌ get_dom_snapshot 오류: {e}")
         return None
+
+
+async def find_and_use_search_bar(query: str) -> bool:
+    """페이지 내에서 검색창을 찾아 검색을 시도"""
+    try:
+        page = await get_current_page()
+        if not page:
+            return False
+
+        elements = await index_interactive_elements()
+        if not elements:
+            return False
+
+        print("--- 페이지 내 상호작용 요소 분석 ---")
+        for i, el in enumerate(elements[:15]): # 처음 15개 요소만 로그로 출력
+            print(f"  - Element {i}: id={el.get('id')}, role={el.get('role')}, placeholder={el.get('placeholder')}, name={el.get('name')}, text={el.get('text')}")
+        print("------------------------------------")
+
+        search_input = None
+        # 다양한 단서를 기반으로 검색창 찾기
+        for el in elements:
+            el_id = el.get('id', '')
+            el_role = el.get('role', '')
+            el_placeholder = el.get('placeholder', '').lower()
+            el_name = el.get('name', '').lower()
+            el_text = el.get('text', '').lower()
+
+            if 'search' in el_role or 'searchbox' in el_role:
+                search_input = el
+                break
+            if 'search' in el_placeholder or '검색' in el_placeholder:
+                search_input = el
+                break
+            if el_name in ['q', 's', 'query', 'search']:
+                search_input = el
+                break
+        
+        if not search_input:
+            print("   페이지 내에서 검색창을 찾지 못했습니다.")
+            return False
+
+        input_id = search_input['id']
+        print(f"   검색창 찾음 (ID: {input_id}). 텍스트 입력 시도...")
+        success = await set_input_by_agentq_id(input_id, query)
+        if not success:
+            print(f"   검색창(ID: {input_id})에 텍스트 입력 실패.")
+            return False
+
+        # 검색 버튼 찾기 (입력창 주변)
+        submit_button = None
+        for el in elements:
+            el_type = el.get('type', '').lower()
+            el_role = el.get('role', '')
+            el_text = el.get('text', '').lower()
+
+            if el_type == 'submit':
+                submit_button = el
+                break
+            if 'search' in el_text or '검색' in el_text:
+                 if el.get('tag') == 'button' or 'button' in el_role:
+                    submit_button = el
+                    break
+
+        if submit_button:
+            button_id = submit_button['id']
+            print(f"   검색 버튼 찾음 (ID: {button_id}). 클릭 시도...")
+            await click_by_agentq_id(button_id)
+        else:
+            # 버튼이 없으면 Enter 키 입력 시도
+            print("   검색 버튼을 찾지 못했습니다. Enter 키 입력을 시도합니다.")
+            await page.locator(f'[data-agentq-id="{input_id}"]').press('Enter')
+        
+        await page.wait_for_load_state('load', timeout=15000)
+        print(f"   페이지 내 검색 성공: {query}")
+        return True
+
+    except Exception as e:
+        print(f"❌ find_and_use_search_bar 오류: {e}")
+        return False

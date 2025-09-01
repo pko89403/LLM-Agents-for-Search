@@ -344,7 +344,7 @@ async def critique_node(state: AgentState) -> Dict[str, Any]:
         if loops < min_loops:
             done = False
 
-        if state.get("no_progress_streak", 0) >= 2 and loops >= min_loops:
+        if state.get("no_progress_streak", 0) >= 3 and loops >= min_loops:
             done = True
             critique += "\nHeuristic: No progress for multiple steps → stopping."
 
@@ -391,7 +391,9 @@ async def critique_node(state: AgentState) -> Dict[str, Any]:
 
         return {
             "done": done,
-            "critique": critique
+            "critique": critique,
+            "no_progress_streak": state["no_progress_streak"],
+            "last_progress_fingerprint": state.get("last_progress_fingerprint")
         }
 
     except Exception as e:

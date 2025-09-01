@@ -9,7 +9,8 @@ from agentq.playwright_helper import (
     click_element, type_text, get_page_content,
     get_page_title, get_page_url,
     index_interactive_elements, get_dom_snapshot,
-    click_by_agentq_id, set_input_by_agentq_id, submit_by_agentq_id, clear_by_agentq_id
+    click_by_agentq_id, set_input_by_agentq_id, submit_by_agentq_id, clear_by_agentq_id,
+    find_and_use_search_bar
 )
 
 
@@ -46,27 +47,32 @@ class WebTool:
             }
     
     @staticmethod
-    async def search_google(query: str) -> Dict[str, Any]:
-        """Google 검색"""
+    async def search(query: str) -> Dict[str, Any]:
+        """현재 페이지에서 검색을 시도하고, 실패하면 Google 검색으로 대체"""
         try:
+            # 1. 현재 페이지에서 검색 시도
+            on_site_success = await find_and_use_search_bar(query)
+            if on_site_success:
+                return {
+                    "success": True,
+                    "message": f"페이지 내 검색 완료: {query}",
+                    "data": None
+                }
+
+            # 2. 실패 시 Google 검색으로 대체
+            print("   페이지 내 검색 실패. Google 검색으로 대체합니다.")
             search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
             success = await navigate_to(search_url)
             
             if success:
                 await asyncio.sleep(2)  # 페이지 로딩 대기
-                
-                # 검색 결과 텍스트 추출
                 page = await get_current_page()
                 if page:
-                    # 검색 결과에서 주요 텍스트 추출
                     search_results = await page.evaluate("""
                         () => {
                             const results = [];
-                            
-                            // 검색 결과 제목과 설명 추출
                             const resultElements = document.querySelectorAll('div[data-ved] h3, .g h3, .rc h3');
                             const descElements = document.querySelectorAll('.VwiC3b, .s3v9rd, .st');
-                            
                             for (let i = 0; i < Math.min(5, resultElements.length); i++) {
                                 const title = resultElements[i]?.innerText || '';
                                 const desc = descElements[i]?.innerText || '';
@@ -74,29 +80,21 @@ class WebTool:
                                     results.push(`${title}: ${desc}`);
                                 }
                             }
-                            
-                            return results.join('\\n\\n');
+                            return results.join('\n\n');
                         }
                     """)
-                    
                     return {
                         "success": True,
-                        "message": f"검색 완료: {query}",
+                        "message": f"Google 검색 완료: {query}",
                         "data": search_results
                     }
-                else:
-                    return {
-                        "success": False,
-                        "message": "페이지 접근 실패",
-                        "data": None
-                    }
-            else:
-                return {
-                    "success": False,
-                    "message": f"검색 페이지 이동 실패: {search_url}",
-                    "data": None
-                }
-                
+            
+            return {
+                "success": False,
+                "message": f"Google 검색 페이지 이동 실패: {search_url}",
+                "data": None
+            }
+
         except Exception as e:
             return {
                 "success": False,
@@ -247,7 +245,7 @@ class ToolExecutor:
                 return await self.web_tool.navigate(action.get("target", ""))
             
             elif action_type == "SEARCH":
-                return await self.web_tool.search_google(action.get("content", ""))
+                return await self.web_tool.search(action.get("content", ""))
             
             elif action_type == "CLICK":
                 by = action.get("by", "")
