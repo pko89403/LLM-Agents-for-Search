@@ -31,17 +31,11 @@ Scoring rules (0.0~1.0):
 - - Dead-ends (login, cookie banners) unless necessary
 - - Irreversible or off-domain navigation without reason
 
-STRICT OUTPUT CONTRACT — READ CAREFULLY:
-- Return ONLY ONE of the following JSON formats with NO prose:
-  1) A JSON array of numbers of length N (N = number of candidates), where element i is the score for candidate i.
-     Example: [0.71, 0.22, 0.53]
-  2) A JSON array of objects covering EVERY candidate exactly once:
-     Example: [{{"index": 0, "score": 0.71}}, {{"index": 1, "score": 0.22}}, {{"index": 2, "score": 0.53}}]
-- Do NOT include code fences or explanations.
-- Do NOT invent or drop candidates.
-- Scores MUST be in [0,1].
-
-You will be given the enumerated candidates (0-based) in the user message. Return ONLY the JSON.
+Return ONLY a compact JSON array:
+[
+  {{"cmd": "<verbatim command>", "score": 0.0~1.0, "rationale": "<short>"}},
+  ...
+]
 """
 }
 

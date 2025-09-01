@@ -49,7 +49,7 @@ class LLMManager:
     def add_ollama_model(
         self,
         name: str = "ollama",
-        model: str = "qwen2.5:7b-instruct-q4_K_M",
+        model: str = "llama3.2:3b",
         base_url: str = None,
         temperature: float = 0.0,
         **kwargs
