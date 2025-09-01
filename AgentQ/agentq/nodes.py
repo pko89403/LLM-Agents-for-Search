@@ -2,7 +2,7 @@
 에이전트의 핵심 의사결정 및 도구 실행 노드 구현
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, List
 from pydantic import BaseModel, Field
 from agentq.state import AgentState, increment_loop_count, add_error, clear_error
 from agentq.llm_utils import get_llm_manager
@@ -19,184 +19,7 @@ import json
 ENABLE_CRITIC = True
 ENABLE_MCTS_LITE = True
 
-#
-# --- Critic 출력 파싱 유틸 ---
-class CriticItem(BaseModel):
-    index: int = Field(..., ge=0, description="Index of the candidate command (0-based).")
-    score: float = Field(..., ge=0.0, le=1.0, description="Confidence 0..1")
 
-class CriticList(BaseModel):
-    items: list[CriticItem]
-def _normalize_cmd(s: str) -> str:
-    import re
-    s = (s or "").strip()
-    s = s.strip('`"\' ')
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-# Ollama JSON Schema for critic ranking (index-based)
-CRITIC_JSON_SCHEMA = {
-    "oneOf": [
-        {
-            "type": "array",
-            "items": {"type": "number", "minimum": 0.0, "maximum": 1.0}
-        },
-        {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["index", "score"],
-                "properties": {
-                    "index": {"type": "integer", "minimum": 0},
-                    "score": {"type": "number", "minimum": 0.0, "maximum": 1.0}
-                }
-            }
-        },
-        {
-            "type": "object",
-            "additionalProperties": True,
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": ["index", "score"],
-                        "properties": {
-                            "index": {"type": "integer", "minimum": 0},
-                            "score": {"type": "number", "minimum": 0.0, "maximum": 1.0}
-                        }
-                    }
-                }
-            },
-            "required": ["items"]
-        }
-    ]
-}
-
-def _extract_json_array(text: str):
-    import json, re
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    try:
-        m = re.search(r"\[[\s\S]*\]", text)
-        if m:
-            return json.loads(m.group(0))
-    except Exception:
-        return None
-    return None
-
-
-def _parse_critic_output(critic_out: str, candidates: list[str]) -> list[tuple[str, float]]:
-    import re
-    cand_norm = [_normalize_cmd(c) for c in candidates]
-    parsed = _extract_json_array(critic_out)
-    print(f"--- CRITIC PARSER: parsed = {parsed} ---")
-    items: list[tuple[str, float]] = []
-
-    def clamp01(x):
-        try:
-            v = float(x)
-        except Exception:
-            return 0.5
-        return 0.0 if v < 0 else 1.0 if v > 1 else v
-
-    # New: handle dict containers and unwrap single-object payloads
-    if isinstance(parsed, dict):
-        # unwrap common containers or single-object payloads
-        if "items" in parsed and isinstance(parsed["items"], list):
-            parsed = parsed["items"]
-        elif "data" in parsed and isinstance(parsed["data"], list):
-            parsed = parsed["data"]
-        elif "choices" in parsed and isinstance(parsed["choices"], list):
-            parsed = parsed["choices"]
-        elif "result" in parsed and isinstance(parsed["result"], list):
-            parsed = parsed["result"]
-        elif ("cmd" in parsed or "command" in parsed or "action" in parsed or "candidate" in parsed or "text" in parsed):
-            parsed = [parsed]
-
-    if isinstance(parsed, list):
-        # Fast path A: pure numeric array -> align by index
-        try:
-            if all(isinstance(x, (int, float)) for x in parsed):
-                nums = [clamp01(x) for x in parsed]
-                items = []
-                for i, c in enumerate(cand_norm):
-                    sc = nums[i] if i < len(nums) else 0.5
-                    items.append((c, sc))
-                # convert back to original text forms
-                return [(candidates[i], items[i][1]) for i in range(len(candidates))]
-        except Exception:
-            pass
-
-        # Fast path B: objects with {"index": int, "score": num}
-        try:
-            if all(isinstance(x, dict) and ("index" in x) for x in parsed):
-                idx_map = {}
-                for x in parsed:
-                    try:
-                        idx = int(x.get("index"))
-                        sc = clamp01(x.get("score", 0.5))
-                        idx_map[idx] = sc
-                    except Exception:
-                        continue
-                items = []
-                for i, c in enumerate(cand_norm):
-                    sc = idx_map.get(i, 0.5)
-                    items.append((c, sc))
-                return [(candidates[i], items[i][1]) for i in range(len(candidates))]
-        except Exception:
-            pass
-
-        for ent in parsed:
-            if isinstance(ent, dict):
-                cmd_key = next((k for k in ent.keys() if k.lower() in ("cmd","command","action","candidate","text")), None)
-                score_key = next((k for k in ent.keys() if k.lower() in ("score","confidence","prob","p")), None)
-                # Use only .get() access for dict fields
-                if cmd_key:
-                    cmd = _normalize_cmd(str(ent.get(cmd_key, "")))
-                    sc = clamp01(ent.get(score_key, 0.5)) if score_key else 0.5
-                    if cmd:
-                        items.append((cmd, sc))
-            elif isinstance(ent, list) and len(ent) >= 1:
-                cmd = _normalize_cmd(str(ent[0]))
-                sc = clamp01(ent[1]) if len(ent) >= 2 else 0.5
-                if cmd:
-                    items.append((cmd, sc))
-            elif isinstance(ent, str):
-                cmd = _normalize_cmd(ent)
-                if cmd:
-                    items.append((cmd, 0.5))
-
-    scores_map: dict[str, float] = {}
-    for i, c in enumerate(candidates):
-        cn = cand_norm[i]
-        score = None
-        for cmd, sc in items:
-            n = _normalize_cmd(cmd)
-            if n == cn:
-                score = sc; break
-        if score is None:
-            for cmd, sc in items:
-                if _normalize_cmd(cmd).casefold() == cn.casefold():
-                    score = sc; break
-        if score is None:
-            for cmd, sc in items:
-                n = _normalize_cmd(cmd)
-                if n and (n in cn or cn in n):
-                    score = sc; break
-        if score is None:
-            score = 0.5
-        scores_map[c] = float(score)
-    # If no items matched, set uniform 0.5 for all candidates
-    if not items:
-        return [(c, 0.5) for c in candidates]
-    return [(c, scores_map[c]) for c in candidates]
 
 
 def _progress_fingerprint(state: AgentState) -> str:
@@ -205,6 +28,29 @@ def _progress_fingerprint(state: AgentState) -> str:
     title = (state.get("page_title") or "")
     content = (state.get("page_content") or "")[:1000]
     return md5(f"{url}|{title}|{content}".encode("utf-8")).hexdigest()
+
+
+# --- Pydantic 모델 정의 ---
+from pydantic import BaseModel, Field
+from typing import List, Dict, Any
+
+
+class ThoughtProcess(BaseModel):
+    """LLM의 사고 과정을 담는 구조화된 모델"""
+    plan: str = Field(description="The overall plan to achieve the objective.")
+    thought: str = Field(description="Concise reasoning for the next action candidates.")
+    commands: List[str] = Field(description="A list of 3-5 candidate commands for the next step.")
+    status: str = Field(description="Should be 'CONTINUE' if the task is not yet complete.")
+
+class CriticScore(BaseModel):
+    """Critic이 평가한 개별 명령어 점수"""
+    cmd: str = Field(description="The verbatim command being scored.")
+    score: float = Field(description="The score from 0.0 to 1.0.")
+    rationale: str = Field(description="A short rationale for the score.")
+
+class CriticOutput(BaseModel):
+    """Critic의 전체 평가 결과"""
+    scores: List[CriticScore]
 
 
 async def plan_node(state: AgentState) -> Dict[str, Any]:
@@ -243,11 +89,10 @@ async def plan_node(state: AgentState) -> Dict[str, Any]:
 
 
 async def thought_node(state: AgentState) -> Dict[str, Any]:
-    """Thought 노드: 후보 생성 → critic 점수화 → 최종 액션 선택"""
+    """Thought 노드: 후보 생성 → critic 점수화 → 최종 액션 선택 (간소화된 버전)"""
     print(f"🤔 Thought 노드 실행 중... (루프 {state['loop_count'] + 1})")
 
     try:
-        # 루프 카운트 증가
         state = increment_loop_count(state)
 
         # 최신 DOM 스냅샷 확보 (없을 때만)
@@ -262,266 +107,88 @@ async def thought_node(state: AgentState) -> Dict[str, Any]:
 
         prompt_builder = get_prompt_builder()
         llm_manager = get_llm_manager()
+        
+        # 1. 후보 커맨드 생성
+        thought_prompt = prompt_builder.build_thought_prompt(state)
+        thought_process: ThoughtProcess = await llm_manager.invoke_structured_with_system(
+            system_prompt=thought_prompt,
+            user_message="Propose multiple candidate COMMANDS for the very next step.",
+            schema_model=ThoughtProcess
+        )
 
-        action = None
-        thought_text = ""
-        cmds = []
-        status = "CONTINUE"
-        best_cmd = None
+        if not thought_process or not thought_process.commands:
+            raise ValueError("LLM으로부터 유효한 커맨드를 생성하지 못했습니다.")
+
+        cmds = thought_process.commands
+        thought_text = thought_process.thought
+        status = thought_process.status
+
         scores = []
-        critic_out = "" # Initialize critic_out
-
-        if ENABLE_CRITIC:
-            # 후보 커맨드 생성 (복잡한 프롬프트 사용)
-            system_prompt = prompt_builder.build_thought_prompt(state)
-            resp = await llm_manager.invoke_with_system(
-                system_prompt=system_prompt,
-                user_message="Propose multiple candidate COMMANDS for the very next step."
+        # 2. Critic으로 랭킹 (활성화된 경우)
+        if ENABLE_CRITIC and cmds:
+            critic_prompt = prompt_builder.build_critic_prompt(state)
+            critic_input = "Rank these commands:\n" + "\n".join([f"- {c}" for c in cmds])
+            
+            critic_output: CriticOutput = await llm_manager.invoke_structured_with_system(
+                system_prompt=critic_prompt,
+                user_message=critic_input,
+                schema_model=CriticOutput
             )
-            raw = clean_response(resp)
-            cmds, status = extract_commands_and_status(raw)
-            thought_text = split_output_blocks(raw).get("THOUGHT", "")
 
-            if cmds and ENABLE_MCTS_LITE:
-                step = "init"
-                try:
-                    critic_out = ""
-                    step = "init"
-                    try:
-                        critic_prompt = prompt_builder.build_critic_prompt(state)
+            if critic_output and critic_output.scores:
+                score_map = {item.cmd.strip(): item.score for item in critic_output.scores}
+                scores = [(cmd, score_map.get(cmd.strip(), 0.5)) for cmd in cmds]
+                print(f"   Critic 점수: { {c: s for c, s in scores} }")
 
-                        # Candidates are enumerated and scoring is index-based
-                        critic_in = (
-                            "You are a ranking critic. For EACH candidate command, assign a confidence score in [0,1]. "
-                            "Return ONLY one of the following JSON formats with NO prose:\n"
-                            "1) A JSON array of numbers of length N (N = number of candidates), where element i is the score for candidate i.\n"
-                            "2) A JSON array of objects {\"index\": <int 0..N-1>, \"score\": <float 0..1>} covering EVERY candidate exactly once.\n\n"
-                            "Candidates (0-based):\n" + "\n".join([f"[{i}] {c}" for i, c in enumerate(cmds)])
-                        )
+        # 점수화 실패 시 균등 분배
+        if not scores and cmds:
+            scores = [(c, 0.5) for c in cmds]
 
-                        # --- 0) First try: enforce JSON Schema (Ollama structured outputs) ---
-                        parsed_scores = None
-                        critic_json_raw = None
-                        step = "json_schema_invoke"
-                        try:
-                            critic_json_raw = await llm_manager.invoke_json_schema_with_system(
-                                critic_prompt,
-                                critic_in,
-                                CRITIC_JSON_SCHEMA,
-                                model_name=None  # use default model
-                            )
-                        except Exception as _e0:
-                            import traceback as _tb
-                            print(f"⚠️ Critic JSON-schema invoke 오류: {_e0}")
-                            _tb.print_exc()
-
-                        if critic_json_raw:
-                            step = "json_schema_parse"
-                            try:
-                                data = critic_json_raw
-                                if not isinstance(data, (dict, list)):
-                                    data = json.loads(critic_json_raw)
-
-                                # Unwrap common containers
-                                if isinstance(data, dict):
-                                    if "items" in data and isinstance(data["items"], list):
-                                        data = data["items"]
-                                    elif "data" in data and isinstance(data["data"], list):
-                                        data = data["data"]
-                                    elif "choices" in data and isinstance(data["choices"], list):
-                                        data = data["choices"]
-                                    elif "result" in data and isinstance(data["result"], list):
-                                        data = data["result"]
-                                    elif any(k in data for k in ("index","score","cmd","command","action","candidate","text")):
-                                        data = [data]
-
-                                critic_out = critic_json_raw if isinstance(critic_json_raw, str) else json.dumps(critic_json_raw)
-
-                                # Only allow index-based scoring
-                                # Case 1: array of numbers -> align by index
-                                if isinstance(data, list) and all(isinstance(x, (int, float)) for x in data):
-                                    nums = [max(0.0, min(1.0, float(x))) for x in data]
-                                    parsed_scores = [(c, nums[i] if i < len(nums) else 0.5) for i, c in enumerate(cmds)]
-
-                                # Case 2: array of {"index": int, "score": num}
-                                if not parsed_scores and isinstance(data, list) and all(isinstance(x, dict) and ("index" in x) for x in data):
-                                    idx_map = {}
-                                    for x in data:
-                                        try:
-                                            idx = int(x.get("index"))
-                                            sc = max(0.0, min(1.0, float(x.get("score", 0.5))))
-                                            idx_map[idx] = sc
-                                        except Exception:
-                                            continue
-                                    parsed_scores = [(c, idx_map.get(i, 0.5)) for i, c in enumerate(cmds)]
-                            except Exception as _ejson:
-                                import traceback as _tb
-                                print(f"⚠️ Critic JSON-schema 파싱 실패: {_ejson}")
-                                _tb.print_exc()
-                                parsed_scores = None
-
-                        # --- 1) Try structured output (OpenAI etc.) ---
-                        step = "structured_invoke"
-                        structured = None
-                        if not parsed_scores:
-                            try:
-                                structured = await llm_manager.invoke_structured_with_system(
-                                    critic_prompt,
-                                    critic_in,
-                                    CriticList
-                                )
-                            except Exception as _e_struct:
-                                import traceback as _tb
-                                print(f"⚠️ Critic structured invoke 실패: {_e_struct}")
-                                _tb.print_exc()
-                                structured = None
-
-                        from pydantic import BaseModel as _PBM
-                        if (not parsed_scores) and isinstance(structured, _PBM):
-                            step = "structured_parse_basemodel"
-                            try:
-                                s_items = getattr(structured, "items", None)
-                                if s_items:
-                                    idx_map = {int(getattr(it, "index")): float(getattr(it, "score")) for it in s_items}
-                                    parsed_scores = [(c, float(idx_map.get(i, 0.5))) for i, c in enumerate(cmds)]
-                            except Exception as _e:
-                                import traceback as _tb
-                                print(f"⚠️ Structured critic 파싱 오류(BaseModel): {_e}")
-                                _tb.print_exc()
-                                parsed_scores = None
-
-                        if (not parsed_scores) and isinstance(structured, (dict, list)):
-                            step = "structured_parse_dictlist"
-                            try:
-                                critic_out = json.dumps(structured)
-                                parsed_scores = _parse_critic_output(critic_out, cmds)
-                            except Exception as _e:
-                                import traceback as _tb
-                                print(f"⚠️ Structured critic 파싱 오류(dict/list): {_e}")
-                                _tb.print_exc()
-                                parsed_scores = None
-                        elif (not parsed_scores) and isinstance(structured, str):
-                            step = "structured_parse_str"
-                            try:
-                                critic_out = structured
-                                parsed_scores = _parse_critic_output(critic_out, cmds)
-                            except Exception as _e:
-                                import traceback as _tb
-                                print(f"⚠️ Structured critic 파싱 오류(str): {_e}")
-                                _tb.print_exc()
-                                parsed_scores = None
-
-                        # --- 2) Fallback: unstructured JSON parsing + one repair retry ---
-                        if not parsed_scores:
-                            step = "fallback_invoke"
-                            critic_out = await llm_manager.invoke_with_system(critic_prompt, critic_in)
-                            step = "fallback_parse"
-                            parsed_scores = _parse_critic_output(critic_out, cmds)
-                            need_retry = (not parsed_scores) or all(abs(s - 0.5) < 1e-6 for _, s in parsed_scores)
-                            if need_retry:
-                                step = "fallback_repair"
-                                repair_user = (
-                                    "Your previous output was INVALID. Return ONLY ONE of the following JSON formats with NO prose:\n"
-                                    "1) A JSON array of numbers of length N (scores for candidates 0..N-1), or\n"
-                                    "2) A JSON array of objects {\"index\": <int 0..N-1>, \"score\": <float 0..1>} that covers EVERY candidate exactly once.\n"
-                                    "Do NOT include code fences or explanations. Candidates are enumerated 0..N-1 as given previously."
-                                )
-                                critic_out2 = await llm_manager.invoke_with_system(critic_prompt, repair_user)
-                                try:
-                                    parsed2 = _parse_critic_output(critic_out2, cmds)
-                                except Exception:
-                                    parsed2 = None
-                                if parsed2:
-                                    parsed_scores = parsed2
-                                    critic_out = critic_out2
-
-                        # --- Logging ---
-                        try:
-                            preview = (critic_out or "<empty>")[:600]
-                            print("   Critic 원본 출력(최종):\n" + preview)
-                            print(f"   [디버그] step = {step}, type(structured) = {type(structured).__name__}")
-                        except Exception:
-                            pass
-
-                        if parsed_scores:
-                            scores.extend(parsed_scores)
-                            try:
-                                sample = ", ".join([f"{c}={s:.2f}" for c, s in parsed_scores[:3]])
-                                print("   Critic 점수 샘플: " + sample)
-                            except Exception:
-                                pass
-                    except Exception as e_inner:
-                        import traceback as _tb
-                        print(f"⚠️ Critic/MCTS-lite 내부 오류(step={step}): {e_inner}")
-                        _tb.print_exc()
-                        # 안전 폴백: 아래 균등 분배 폴백으로 이어짐
-                except Exception as e_outer:
-                    import traceback as _tb
-                    print(f"⚠️ Critic/MCTS-lite 블록 오류(outer): {e_outer}")
-                    _tb.print_exc()
-
-            # Single consolidated fallback for empty scores and cmds
-            if not scores and cmds:
-                scores = [(c, 0.5) for c in cmds]
-
-            if scores:
-                # Q 통계와 결합 (간단한 UCB-lite)
+        # 3. 최종 액션 선택 (MCTS-lite)
+        best_cmd = ""
+        action = None
+        if scores:
+            if ENABLE_MCTS_LITE:
                 qstats = state.get("q_stats") or {}
                 alpha = 0.5
-                scored = []
+                scored_cmds = []
                 for c, s in scores:
                     q = qstats.get(c, {}).get("Q", 0.0)
                     n = qstats.get(c, {}).get("N", 0)
                     bonus = 0.1 if n == 0 else 0.0
                     total = alpha * s + (1 - alpha) * q + bonus
-                    scored.append((total, c))
-                scored.sort(reverse=True)
-                try:
-                    preview = ", ".join([f"{c}~{t:.2f}" for t, c in sorted(scored, reverse=True)[:3]])
-                    print(f"   UCB-lite 상위: {preview}")
-                except Exception:
-                    pass
-                best_cmd = scored[0][1]
-                action = parse_command_line(best_cmd)
+                    scored_cmds.append((total, c))
+                
+                scored_cmds.sort(reverse=True)
+                best_cmd = scored_cmds[0][1]
+                print(f"   UCB-lite 상위: { {c: t for t, c in scored_cmds[:3]} }")
             else:
-                # Critic/MCTS-lite 실패 시 Option A (단일 액션)으로 폴백
-                print("⚠️ Critic/MCTS-lite 실패 또는 후보 없음. Option A로 폴백합니다.")
-                # Fallback to Option A logic
-                system_prompt = prompt_builder.build_thought_prompt(state) # 이 프롬프트는 이제 단순화된 버전
-                resp = await llm_manager.invoke_with_system(
-                    system_prompt=system_prompt,
-                    user_message="What should be the next action based on the current situation?"
-                )
-                thought_text = clean_response(resp)
-                action = extract_action_from_response(thought_text) # 단순화된 파서 사용
-        else: # ENABLE_CRITIC is False
-            # Option A (단일 액션) 프롬프트 사용
-            system_prompt = prompt_builder.build_thought_prompt(state) # 이 프롬프트는 이제 단순화된 버전
-            resp = await llm_manager.invoke_with_system(
-                system_prompt=system_prompt,
-                user_message="What should be the next action based on the current situation?"
-            )
-            thought_text = clean_response(resp)
-            action = extract_action_from_response(thought_text) # 단순화된 파서 사용
+                # MCTS 비활성화 시 critic 점수만으로 선택
+                best_cmd = max(scores, key=lambda item: item[1])[0]
+            
+            action = parse_command_line(best_cmd)
 
-        # 상태 업데이트
-        state["thought"] = thought_text or "다음 행동을 결정했습니다."
-        state["candidate_commands"] = cmds
-        state["critic_scores"] = [s for _, s in scores] if scores else []
-        state["status"] = status
-        state["last_command"] = best_cmd if 'best_cmd' in locals() else None
-        state["action"] = action
+        # Fallback: 액션 선택 실패 시
+        if not action:
+            best_cmd = cmds[0] if cmds else "GET_DOM"
+            action = parse_command_line(best_cmd)
 
-        # 스크래치패드 기록
+        # 4. 상태 업데이트
+        state.update({
+            "thought": thought_text,
+            "candidate_commands": cmds,
+            "critic_scores": [s for _, s in scores],
+            "status": status,
+            "last_command": best_cmd,
+            "action": action,
+        })
+
         state = ScratchpadManager.add_thought(state, state["thought"])
         if action:
             state = ScratchpadManager.add_action(state, action)
 
         print(f"   사고 과정: {state['thought'][:100]}...")
-        if action:
-            print(f"   계획된 액션: {action.get('type')}")
-        else:
-            print("   액션이 추출되지 않았습니다.")
+        print(f"   계획된 액션: {action.get('type') if action else '없음'}")
 
         return {
             "thought": state["thought"],
@@ -529,15 +196,21 @@ async def thought_node(state: AgentState) -> Dict[str, Any]:
             "loop_count": state["loop_count"],
             "candidate_commands": cmds
         }
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         error_msg = f"Thought 노드 실행 중 오류: {str(e)}"
         print(f"❌ {error_msg}")
         state = add_error(state, error_msg)
         return {
             "thought": "다음 행동을 결정하는데 실패했습니다.",
-            "action": None,
+            "action": {"type": "GET_DOM"}, # 에러 발생 시 안전한 액션으로 폴백
             "loop_count": state["loop_count"]
         }
+
+
+
 
 
 async def action_node(state: AgentState) -> Dict[str, Any]:
