@@ -1,170 +1,150 @@
-# `langgraph-supervisor`와 전역 메시지 풀(블랙보드) 연동 예제
+### **PersonaRAG 구현 가이드 (세분화된 에이전트 패턴 v5.3)**
 
-`langgraph-supervisor`를 전역 메시지 풀 스키마(`pool: Annotated[List[AnyMessage], add_messages]`)와 연동하여 실행 가능한 형태로 변형한 버전입니다. Supervisor는 대화를 관리하고, 그 결과를 전역 풀에 미러링하여 블랙보드(SSOT)에 축적하는 구조입니다.
+**목표:** v3.0 아키텍처의 각 핵심 기능을 독립된 워커 에이전트로 구현하고, Supervisor가 이들을 정교하게 지휘하는 최종 시스템을 구축합니다.
 
-## 설치
-```bash
-pip install -U langgraph-supervisor langgraph langchain-openai
-export OPENAI_API_KEY=<YOUR_KEY>
+---
+
+#### **1. 아키텍처 변경점: 세분화된 전문가 모델**
+
+*   **이전 (v5.2):** `profile_manager`, `information_retriever` 등 여러 도구를 가진 **범용 전문가** 모델
+*   **변경 (v5.3):** `user_profile_agent`, `retrieval_agent`, `ranking_agent`, `feedback_agent` 등 **단일 책임**을 가진 **세분화된 전문가** 모델
+
+`Live Session`은 `AgentState`의 `messages` 리스트로서, 모든 에이전트가 자신의 작업 기록과 결과를 게시하고 다른 에이전트의 작업을 참조하는 '공용 블랙보드' 역할을 합니다.
+
+---
+
+#### **2. 1단계: 도구 정의 (`persona_rag/tools.py`)**
+
+도구 정의는 이전과 동일합니다. 각 도구는 하나의 명확한 기능을 수행합니다.
+
+```python
+# persona_rag/tools.py
+# (v5.2 가이드와 동일한 내용)
+
+import json
+from langchain_core.tools import tool
+
+@tool
+def get_user_profile(user_id: str) -> dict:
+    """사용자 ID를 기반으로 영속적인 사용자 프로필을 조회합니다."""
+    # ... (구현은 이전과 동일)
+    print(f"--- Tool: get_user_profile(user_id='{user_id}') ---")
+    try:
+        with open(f"profiles/user_{user_id}.json", "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"error": "User profile not found."}
+
+
+@tool
+def update_user_profile(user_id: str, feedback_summary: str) -> str:
+    """사용자 피드백 요약을 바탕으로 사용자 프로필을 업데이트합니다."""
+    # ... (구현은 이전과 동일)
+    print(f"--- Tool: update_user_profile(user_id='{user_id}', feedback='{feedback_summary}') ---")
+    profile = get_user_profile(user_id)
+    profile.setdefault("notes", []).append(feedback_summary)
+    with open(f"profiles/user_{user_id}.json", "w") as f:
+        json.dump(profile, f, indent=2)
+    return f"Profile for {user_id} updated successfully."
+
+@tool
+def contextual_retrieval(query: str, user_profile: dict) -> list[str]:
+    """사용자 프로필과 쿼리를 바탕으로 문맥에 맞는 정보를 검색합니다."""
+    # ... (구현은 이전과 동일)
+    print(f"--- Tool: contextual_retrieval(query='{query}') ---")
+    return [
+        "LangGraph는 복잡한 LLM 워크플로우를 만들기 위한 라이브러리입니다.",
+        "Supervisor 패턴은 LLM을 오케스트레이터로 사용합니다.",
+        "Cross-encoder 모델은 문서 순위 재조정에 효과적입니다."
+    ]
+
+@tool
+def document_ranking(documents: list[str], query: str) -> list[str]:
+    """검색된 문서 목록을 사용자의 질문과의 관련성을 기준으로 순위를 재조정합니다."""
+    # ... (구현은 이전과 동일)
+    print(f"--- Tool: document_ranking(query='{query}') ---")
+    documents.reverse()
+    return documents
 ```
 
-## supervisor_with_global_pool.py
+---
+
+#### **3. 2단계: 세분화된 워커 에이전트 생성 (`persona_rag/agents.py`)**
+
+**이 단계가 핵심적인 변경점입니다.** 각 에이전트는 이제 단 하나의 도구와 단 하나의 책임을 가집니다.
+
 ```python
-from typing import TypedDict, Annotated, List, Dict, Any
-from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph.message import add_messages
-from langchain_core.messages import AnyMessage, AIMessage, HumanMessage, SystemMessage
+# persona_rag/agents.py
+
 from langgraph.prebuilt import create_react_agent
+from langchain_openai import ChatOpenAI
+from persona_rag import tools
+
+# 공통 LLM 정의
+llm = ChatOpenAI(model="gpt-4o")
+
+# --- 각 기능을 독립된 에이전트로 정의 ---
+
+user_profile_agent = create_react_agent(
+    llm,
+    tools=[tools.get_user_profile],
+    name="user_profile_agent",
+    prompt="You are a user profile specialist. Your sole job is to fetch a user's profile using the provided tool."
+)
+
+retrieval_agent = create_react_agent(
+    llm,
+    tools=[tools.contextual_retrieval],
+    name="retrieval_agent",
+    prompt="You are a retrieval specialist. Your sole job is to find documents based on a query and user profile."
+)
+
+ranking_agent = create_react_agent(
+    llm,
+    tools=[tools.document_ranking],
+    name="ranking_agent",
+    prompt="You are a ranking specialist. Your sole job is to re-rank a list of documents based on relevance to a query."
+)
+
+feedback_agent = create_react_agent(
+    llm,
+    tools=[tools.update_user_profile],
+    name="feedback_agent",
+    prompt="You are a feedback specialist. Your sole job is to update a user's profile based on a summary of their feedback."
+)
+```
+
+---
+
+#### **4. 3단계: Supervisor 그래프 조립 (`persona_rag/graph.py`)**
+
+Supervisor의 프롬프트가 더 길고 정교해집니다. 이제 여러 명의 단일 기능 전문가들을 순서대로 지휘해야 합니다.
+
+```python
+# persona_rag/graph.py
+
 from langgraph_supervisor import create_supervisor
-
-# ---------------------------
-# 1) Global State (전역 메시지 풀 스키마)
-# ---------------------------
-class GlobalState(TypedDict):
-    pool: Annotated[List[AnyMessage], add_messages]  # 글로벌 메시지 허브(SSOT)
-    profile: Dict[str, Any]
-    metrics: Dict[str, Any]
-
-def pool_append(content: str, **meta) -> Dict[str, Any]:
-    """Supervisor 결과를 전역 풀에 append하기 위한 헬퍼."""
-    msg = AIMessage(
-        content=content,
-        additional_kwargs={"metadata": meta}  # 예: stage/route/score/from/to/scope/topic/ts
-    )
-    return {"pool": [msg]}
-
-def pool_view_for_supervisor(state: GlobalState) -> List[Dict[str, str]]:
-    """
-    Supervisor/에이전트에 전달할 messages 뷰 구성.
-    - 블랙보드에 쌓인 Human/AI 메시지를 standard {role, content}로 변환.
-    - 필요 시 scope/topic 필터링 로직을 추가 가능.
-    """
-    view: List[Dict[str, str]] = []
-    for m in state["pool"]:
-        role = "assistant"
-        if isinstance(m, HumanMessage):
-            role = "user"
-        elif isinstance(m, SystemMessage):
-            role = "system"
-        view.append({"role": role, "content": m.content})
-    return view
-
-# ---------------------------
-# 2) LLM & 도메인별 에이전트 정의
-# ---------------------------
-model = ChatOpenAI(model="gpt-4o-mini")
-
-# 간단한 툴들 (예시)
-def add(a: float, b: float) -> float: return a + b
-def multiply(a: float, b: float) -> float: return a * b
-def web_search(query: str) -> str: return "Example search result for: " + query
-
-math_agent = create_react_agent(
-    model=model,
-    tools=[add, multiply],
-    name="math_expert",
-    prompt="You are a math expert. Use tools as needed; one tool call at a time."
+from persona_rag.agents import (
+    llm,
+    user_profile_agent,
+    retrieval_agent,
+    ranking_agent,
+    feedback_agent
 )
+from persona_rag.state import AgentState
 
-research_agent = create_react_agent(
-    model=model,
-    tools=[web_search],
-    name="research_expert",
-    prompt="You are a world-class researcher with access to a web_search tool."
-)
-
-# ---------------------------
-# 3) Supervisor (상위 오케스트레이터)
-# ---------------------------
-supervisor_workflow = create_supervisor(
-    [research_agent, math_agent],
-    model=model,
+# Supervisor에게 더 많은 워커들을 소개하고, 더 상세한 작업 흐름을 지시합니다.
+supervisor_graph = create_supervisor(
+    llm=llm,
+    agents=[
+        user_profile_agent,
+        retrieval_agent,
+        ranking_agent,
+        feedback_agent
+    ],
+    state_schema=AgentState,
     prompt=(
-        "You are a team supervisor managing a research expert and a math expert. "
-        "Use research_expert for information gathering. "
-        "Use math_expert for calculations. "
-        "When ready, return a concise final answer."
-    ),
-)
-app = supervisor_workflow.compile(checkpointer=InMemorySaver())
-
-# ---------------------------
-# 4) 실행 어댑터: Supervisor ↔ 전역 풀(블랙보드) 동기화
-# ---------------------------
-def supervisor_step(state: GlobalState) -> GlobalState:
-    """
-    - 전역 풀의 대화 뷰를 Supervisor에 입력
-    - Supervisor가 생성한 전체 messages를 받아
-      - 마지막 assistant 응답을 블랙보드에 append
-      - (선택) 중간 에이전트/툴 메세지도 메타와 함께 append
-    """
-    # 4-1) 전역 풀 → Supervisor 입력 뷰
-    messages_view = pool_view_for_supervisor(state)
-    if not messages_view:
-        # 최초 실행이면, 시스템 안내를 블랙보드에 심어둔다(선택)
-        state = GlobalState(pool=[SystemMessage(content="Global pool init")], profile={}, metrics={})
-        messages_view = pool_view_for_supervisor(state)
-
-    # 4-2) Supervisor 실행
-    result = app.invoke({"messages": messages_view})
-    sup_msgs = result.get("messages", [])
-
-    # 4-3) Supervisor 결과를 블랙보드로 반영
-    # - 마지막 assistant 메시지를 우선 append
-    last_assistant = next((m for m in reversed(sup_msgs) if m.get("role") == "assistant"), None)
-    if last_assistant:
-        state.update(pool_append(
-            last_assistant["content"],
-            stage="answer", route="supervisor", scope="public"
-        ))
-
-    # (선택) 중간 체인/툴콜/에이전트 메시지를 메타와 함께 기록하고 싶다면 아래 주석 해제
-    # for m in sup_msgs:
-    #     if m.get("role") == "tool":
-    #         state.update(pool_append(
-    #             f"[tool] {m.get('content','')}",
-    #             stage="tool", route=m.get("name","?"), scope="private"
-    #         ))
-
-    return state
-
-# ---------------------------
-# 5) 데모 실행
-# ---------------------------
-if __name__ == "__main__":
-    # 초기 전역 상태(블랙보드)
-    state: GlobalState = {
-        "pool": [
-            HumanMessage(content="what's 12 * 7 plus the length of 'FAANG'?")
-        ],
-        "profile": {"reading_level": "concise"},
-        "metrics": {}
-    }
-
-    # 1턴 실행
-    state = supervisor_step(state)
-    print("=== Global Pool After Turn 1 ===")
-    for m in state["pool"]:
-        role = type(m).__name__.replace("Message", "").lower()
-        meta = (m.additional_kwargs or {}).get("metadata", {})
-        print(f"- {role}: {m.content}  | meta={meta}")
-
-    # 2턴: 사용자 추가 질의 → 동일 전역 풀에 누적
-    state["pool"].append(HumanMessage(content="and add 3 more. show your final number only."))
-    state = supervisor_step(state)
-    print("
-=== Global Pool After Turn 2 ===")
-    for m in state["pool"]:
-        role = type(m).__name__.replace("Message", "").lower()
-        meta = (m.additional_kwargs or {}).get("metadata", {})
-        print(f"- {role}: {m.content}  | meta={meta}")
-
-## 포인트 설명
-*   **SSOT 블랙보드**: `pool: Annotated[List[AnyMessage], add_messages]`로 전역 메시지 허브를 한 곳에서 보존합니다. 모든 결과는 `pool_append()`로 append-only로 기록해 감사/재현이 용이합니다.
-*   **뷰 분리**: `pool_view_for_supervisor()`에서 Supervisor/에이전트가 쓸 가시성 뷰를 만들어 전달합니다(필요 시 scope/topic 기반 필터 추가).
-*   **양방향 동기화**: Supervisor 실행 결과의 최종 assistant 응답(그리고 필요하면 툴/중간 응답)도 다시 블랙보드에 적재합니다. 이렇게 하면 이후 단계(랭킹/피드백/적응)에서 전역 맥락만 보면 됩니다.
-*   **확장 지점**:
-    *   Swarm 서브그래프를 Retrieval 단계에 붙일 경우, `supervisor_step()` 안에서 Supervisor 대신 Swarm을 호출하고 결과들을 동일한 방식으로 `pool_append()` 하시면 됩니다.
-    *   체크포인터는 `InMemorySaver` 대신 `SqliteSaver`/`PostgresSaver`로 교체해 세션 간 지속성을 확보하세요.
-    *   운영 규약(Contract): 메시지 `metadata` 표준(예: `stage/route/score/from/to/scope/topic/ts`)을 강제하여 라우팅·품질·보안 규칙을 한 곳에서 구현할 수 있습니다.
+        "You are a meticulous project manager supervising a team of highly specialized AI agents.\n"
+        "Your team consists of:\n"
+        "- user_profile_agent: Only fetches user profile data.\n"
+        "- retrieval_agent: Only retrieves documents.\n"
